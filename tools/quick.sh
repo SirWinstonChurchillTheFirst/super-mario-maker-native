@@ -2,7 +2,7 @@
 # quick.sh NAME "GAME FOLDER" [SECONDS] : rebuild win/build-NAME (port sources + runtime) and run it WITHOUT a window
 # (TTT2_GPU=null), to find the next missing system function or fault fast. Prints why it stopped.
 NAME=$1; GAME=$2; SECS=${3:-40}
-R=/d/retro/wiiurecomp
+R=${WIIU_WORK:-$HOME/wiiurecomp}
 bash $R/tools/win_build.sh $NAME | tail -4
 mkdir -p $R/win/run/$NAME/save && cd $R/win/run/$NAME || exit 1
 W=$(cygpath -m "$PWD")

@@ -3,8 +3,8 @@
 # shell's /launch WITHOUT input (title screen stays), saves the scan buffer the game made (TTT2_CAPTURE, from 38 s
 # every 4 s) and, at the same moments, what X shows (x11grab, full size PNG). Temp guard runs alongside.
 # Results: console/run/<name>-<tag>/ (tv_*.png = game's own picture, x_*.png = screen), log line "trace: saved".
-NAME=$1; TITLE=$2; TAG=$3; EXTRA=$4; H=${5:-root@192.168.178.75}
-OUT=/d/retro/wiiurecomp/console/run/$NAME-$TAG; mkdir -p "$OUT"
+NAME=$1; TITLE=$2; TAG=$3; EXTRA=$4; H=${5:-${CONSOLE_HOST:-root@batocera.local}}
+OUT=${WIIU_WORK:-$HOME/wiiurecomp}/console/run/$NAME-$TAG; mkdir -p "$OUT"
 mkdir /tmp/wiiu-console-test.lock 2>/dev/null || { echo "stop: another console test is running"; exit 1; }
 trap 'rmdir /tmp/wiiu-console-test.lock 2>/dev/null' EXIT
 B=/userdata/ports-native/wiiu/$NAME

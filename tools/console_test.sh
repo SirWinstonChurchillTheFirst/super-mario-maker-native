@@ -4,15 +4,15 @@
 # screen every 20 s, the sound stream at the end, frame pacing lines in the log. Afterwards the game is ended,
 # the test switches are removed and a picture shows what the console is left in (must be Nova Home).
 # Refuses when a game is already running there (the player may be playing).
-NAME=$1; TITLE=$2; SECS=${3:-120}; INPUT=$4; TAG=${5:-c1}; H=${6:-root@192.168.178.107}
-OUT=/d/retro/wiiurecomp/console/run/$NAME-$TAG; mkdir -p "$OUT"
+NAME=$1; TITLE=$2; SECS=${3:-120}; INPUT=$4; TAG=${5:-c1}; H=${6:-${CONSOLE_HOST:-root@batocera.local}}
+OUT=${WIIU_WORK:-$HOME/wiiurecomp}/console/run/$NAME-$TAG; mkdir -p "$OUT"
 # One run at a time: a second run's "end the game" hit the first run's game on 19 November and left Alt+F4 held
 # on the virtual hotkey keyboard (every game then closed 3 s after its start, until "xinput disable/enable").
 mkdir /tmp/wiiu-console-test.lock 2>/dev/null || { echo "stop: another console_test.sh is running (or remove /tmp/wiiu-console-test.lock)"; exit 1; }
 trap 'rmdir /tmp/wiiu-console-test.lock 2>/dev/null' EXIT
 B=/userdata/ports-native/wiiu/$NAME
 # Temperature guard (lost at every reboot): copied up, then a pause (dropbear throttles quick logins).
-scp -q -l 1500 /d/retro/wiiurecomp/tools/tguard.sh $H:/tmp/tguard.sh 2>/dev/null; sleep 11
+scp -q -l 1500 ${WIIU_WORK:-$HOME/wiiurecomp}/tools/tguard.sh $H:/tmp/tguard.sh 2>/dev/null; sleep 11
 run=$(ssh -o ConnectTimeout=10 $H 'curl -s -m 3 localhost:1234/runningGame' 2>/dev/null)
 echo "$run" | grep -q "NO GAME RUNNING\|\"name\": \"Nova Home\"" || { echo "stop: a game is running on the console"; exit 1; }
 ssh $H "rm -rf $B/save-test; mkdir -p $B/save-test; rm -f /tmp/wiiu-*.jpg
@@ -52,6 +52,6 @@ if fs:
     sheet = Image.new('RGB', (480 * cols, 270 * rows))
     for i, f in enumerate(fs):
         sheet.paste(Image.open(f).convert('RGB').resize((480, 270)), ((i % cols) * 480, (i // cols) * 270))
-    p = f'D:/retro/screenshots/wiiurecomp/console-{name}-{tag}-sheet.jpg'
+    p = f'{__import__("os").environ.get("WIIU_SHOTS", ".")}/console-{name}-{tag}-sheet.jpg'
     sheet.save(p, quality=85); print(len(fs), 'pictures ->', p)
 PY

@@ -11,8 +11,8 @@
 # After it: start the ports script once through the menu's interface and LOOK at the picture
 #   curl -s -X POST localhost:1234/launch -d "/userdata/roms/ports/<Title> (Nativ).sh"
 set -e
-N=$1; TITLE=$2; FOLDER=$3; ROM=$4; H=${5:-root@192.168.178.107}
-P=/d/retro/wiiurecomp
+N=$1; TITLE=$2; FOLDER=$3; ROM=$4; H=${5:-${CONSOLE_HOST:-root@batocera.local}}
+P=${WIIU_WORK:-$HOME/wiiurecomp}
 OUT=$P/console/out/$N; mkdir -p "$OUT"
 running=$(ssh -o ConnectTimeout=10 $H 'curl -s -m 3 localhost:1234/runningGame' 2>/dev/null)
 echo "$running" | grep -q "NO GAME RUNNING\|\"name\": \"Nova Home\"" || { echo "stop: a game is running on the console"; exit 1; }
@@ -27,7 +27,7 @@ push() {  # push <local file> <path on the console>
   md5sum "$1" | cut -c1-32; rm -rf $T
 }
 
-wsl -e bash -lc "strip -o /mnt/d/retro/wiiurecomp/console/out/$N/cafegame ~/wiiu/build-$N/cafegame && cp ~/wiiu/build-$N/fonts/CafeStd.ttf /mnt/d/retro/wiiurecomp/console/out/$N/CafeStd.ttf"
+wsl -e bash -lc "strip -o ${WIIU_WORK_WSL:-/mnt/c/wiiurecomp}/console/out/$N/cafegame ~/wiiu/build-$N/cafegame && cp ~/wiiu/build-$N/fonts/CafeStd.ttf ${WIIU_WORK_WSL:-/mnt/c/wiiurecomp}/console/out/$N/CafeStd.ttf"
 B=/userdata/ports-native/wiiu
 ssh $H "mkdir -p $B/$N/fonts $B/$N/save $B/lib; [ -f $B/$N/cafegame ] && cp -p $B/$N/cafegame $B/$N/cafegame.vor-\$(date +%Y%m%d-%H%M); true" 2>/dev/null
 # Game data on the SSD: /userdata/roms is a merged view of the hard disk without a page cache there,

@@ -1,9 +1,9 @@
 #!/bin/bash
 # run_gpu.sh NAME "GAME FOLDER" SECONDS "INPUT SCRIPT" [TAG] : run win/build-NAME/cafegame.exe on the PC's graphics card
 # (Git Bash), window at 1280x720, a TV picture every 3 s, sound to a WAV, frame pacing lines; then a contact sheet
-# D:\retro\screenshots\wiiurecomp\NAME-TAG-sheet.jpg and a short summary.
+# $WIIU_SHOTS/NAME-TAG-sheet.jpg and a short summary.
 NAME=$1; GAME=$2; SECS=${3:-45}; INPUT=$4; TAG=${5:-gpu}
-ROOT=/d/retro/wiiurecomp/win; RUN=$ROOT/run/$NAME
+ROOT=${WIIU_WORK:-$HOME/wiiurecomp}/win; RUN=$ROOT/run/$NAME
 mkdir -p "$RUN/save" "$RUN/cap-$TAG"; rm -f "$RUN/cap-$TAG"/*.png
 PY=$(command -v python)   # the Windows Python (has PIL), found before the compiler tools come first on PATH
 export PATH="/c/msys64/clang64/bin:$PATH"
@@ -11,7 +11,7 @@ cd "$RUN" || exit 1
 W=$(cygpath -m "$RUN")
 # Pictures of the window itself too (the runtime's own capture saves nothing for some titles).
 # NOWINCAP=1: no window photos (each one holds the window for ~0.1 s, which shows as late pictures in the pacing numbers)
-[ -n "$NOWINCAP" ] || "$PY" /d/retro/wiiurecomp/tools/wincap_loop.py cafegame.exe "$W/cap-$TAG" ${INTERVAL:-3} $((SECS / ${INTERVAL:-3})) > wincap-$TAG.log 2>&1 &
+[ -n "$NOWINCAP" ] || "$PY" ${WIIU_WORK:-$HOME/wiiurecomp}/tools/wincap_loop.py cafegame.exe "$W/cap-$TAG" ${INTERVAL:-3} $((SECS / ${INTERVAL:-3})) > wincap-$TAG.log 2>&1 &
 CAFE_SAVE_DIR="$W/save" TTT2_SCALE=1 TTT2_CAPTURE="$W/cap-$TAG" TTT2_CAPTURE_INTERVAL=${INTERVAL:-3} TTT2_CAPTURE_TV_ONLY=1 \
   TTT2_TRACE_PACING=1 TTT2_TRACE_FS=${TRACEFS:-}  TTT2_AUDIO_DUMP="$W/audio-$TAG.wav" TTT2_INPUT_SCRIPT="$INPUT" \
   timeout $SECS "$ROOT/build-$NAME/cafegame.exe" "$(cygpath -m "$GAME")" > $TAG.log 2>&1
@@ -29,7 +29,7 @@ if fs:
     sheet = Image.new('RGB', (480 * cols, 270 * rows))
     for i, f in enumerate(fs):
         sheet.paste(Image.open(f).convert('RGB').resize((480, 270)), ((i % cols) * 480, (i // cols) * 270))
-    out = f'D:/retro/screenshots/wiiurecomp/{name}-{tag}-sheet.jpg'
+    out = f'{__import__("os").environ.get("WIIU_SHOTS", ".")}/{name}-{tag}-sheet.jpg'
     sheet.save(out, quality=85); print(len(fs), 'pictures ->', out)
 else:
     print('no pictures')

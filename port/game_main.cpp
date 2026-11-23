@@ -38,6 +38,8 @@ void early_guest_memory(); // port/patch_guest_dmabuf.py: TTT2_GUEST_DMABUF=1 (L
 
 // Program modules next to the title (port/modules.cpp sets it; null in ports without modules).
 void (*cafegame_module_loader)(cafe::LoadedImage& title) = nullptr;
+// The program's folder (port/modules_dyn.cpp reads module-imports.map from there).
+std::filesystem::path cafegame_dir;
 
 namespace {
 
@@ -74,6 +76,7 @@ int main(int argc, char** argv) {
     std::vector<std::filesystem::path> layers(argv + 1, argv + argc);
     vfs::open_game(layers);
     const std::filesystem::path here = std::filesystem::absolute(argv[0]).parent_path();
+    cafegame_dir = here;
     if (const char* save = std::getenv("CAFE_SAVE_DIR")) {
         vfs::set_save_root(save);
     } else {

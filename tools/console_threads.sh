@@ -2,7 +2,7 @@
 # console_threads.sh NAME "TITLE" WAIT_SECS "INPUT SCRIPT" [host]: starts a native Wii U port on the console like
 # console_test.sh (test save folder, menu interface), samples every thread's CPU time over 5 s after WAIT_SECS and
 # prints the busiest threads (name, % of one core), then ends the game. One ssh session. Refuses while a game runs.
-NAME=$1; TITLE=$2; WAIT=${3:-45}; INPUT=$4; H=${5:-root@192.168.178.75}
+NAME=$1; TITLE=$2; WAIT=${3:-45}; INPUT=$4; H=${5:-${CONSOLE_HOST:-root@batocera.local}}
 B=/userdata/ports-native/wiiu/$NAME
 mkdir /tmp/wiiu-console-test.lock 2>/dev/null || { echo "stop: another console test is running"; exit 1; }
 trap 'rmdir /tmp/wiiu-console-test.lock 2>/dev/null' EXIT

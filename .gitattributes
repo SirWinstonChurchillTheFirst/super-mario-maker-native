@@ -1,0 +1,10 @@
+# Scripts and the patch must keep LF line endings on Windows checkouts too (bash and git apply need them).
+*.sh text eol=lf
+*.py text eol=lf
+*.patch -text
+*.diff -text
+*.cpp text eol=lf
+*.h text eol=lf
+*.conf text eol=lf
+*.cmake text eol=lf
+*.txt text eol=lf

@@ -2,9 +2,9 @@
 # win_build.sh NAME : Windows build of one translated title (Git Bash). Copies the generated code from WSL
 # (~/wiiu/gen/NAME) to win/gen/NAME if it is not there, syncs the runtime and the port sources, configures
 # win/build-NAME once and builds cafegame.exe. Log: win/build-NAME/build.log
-NAME=$1; R=/d/retro/wiiurecomp; W=D:/retro/wiiurecomp/win
-[ -d $R/win/gen/$NAME ] || wsl -e bash -lc "mkdir -p /mnt/d/retro/wiiurecomp/win/gen && cp -r ~/wiiu/gen/$NAME /mnt/d/retro/wiiurecomp/win/gen/"
-wsl -e bash -lc "cp -ru ~/wiiu/smash4/runtime /mnt/d/retro/wiiurecomp/win/smash4/"
+NAME=$1; R=${WIIU_WORK:-$HOME/wiiurecomp}; W=$(cygpath -m "${WIIU_WORK:-$HOME/wiiurecomp}")/win
+[ -d $R/win/gen/$NAME ] || wsl -e bash -lc "mkdir -p ${WIIU_WORK_WSL:-/mnt/c/wiiurecomp}/win/gen && cp -r ~/wiiu/gen/$NAME ${WIIU_WORK_WSL:-/mnt/c/wiiurecomp}/win/gen/"
+wsl -e bash -lc "cp -ru ~/wiiu/smash4/runtime ${WIIU_WORK_WSL:-/mnt/c/wiiurecomp}/win/smash4/"
 cp $R/port/*.cpp $R/win/port/
 export PATH="/c/msys64/clang64/bin:$PATH"
 cd $R/win || exit 1

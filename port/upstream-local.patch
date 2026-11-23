@@ -40,6 +40,33 @@ index 3c3e931..97efb60 100644
 +    target_include_directories(cafegame PRIVATE runtime/src)
 +    target_link_libraries(cafegame PRIVATE cafe_runtime game_generated)
  endif()
+diff --git a/recomp/src/codegen.cpp b/recomp/src/codegen.cpp
+index d11a223..4a83604 100644
+--- a/recomp/src/codegen.cpp
++++ b/recomp/src/codegen.cpp
+@@ -36,8 +36,9 @@ public:
+                              entry.address != function_.address ? " (alternate entry)"
+                                                                  : "");
+         out_ += text::format("PPC_FUNC({}_orig) {{\n", name);
+-        if (entry.address != function_.address) {
+-            line(text::format("goto loc_{:08X};", entry.address));
++        // port/patch_unaligned_entry.py: an unaligned entry (a symbol at an odd address) starts at its instruction.
++        if ((entry.address & ~3u) != function_.address) {
++            line(text::format("goto loc_{:08X};", entry.address & ~3u));
+         }
+         const uint32_t end = function_.address + function_.size;
+         for (uint32_t a = function_.address; a < end; a += 4) {
+@@ -635,7 +636,9 @@ private:
+         case Op::eieio:
+             line("__atomic_signal_fence(__ATOMIC_SEQ_CST);");
+             return;
+-        case Op::dcbf:
++        case Op::dcbf: // port/patch_dcbf.py: the CPU wrote this line (the renderer keeps GPU copies)
++            line(text::format("ppc::dcbf({});", ea_x(ra, rb)));
++            return;
+         case Op::dcbi:
+         case Op::dcbst:
+         case Op::dcbt:
 diff --git a/recomp/src/program.cpp b/recomp/src/program.cpp
 index b70a772..20bc428 100644
 --- a/recomp/src/program.cpp
@@ -276,7 +303,7 @@ index e257ea8..392c34e 100644
  }
  
 diff --git a/runtime/include/cafe/input.h b/runtime/include/cafe/input.h
-index 96b6a3a..c3d81c4 100644
+index 96b6a3a..7d29a67 100644
 --- a/runtime/include/cafe/input.h
 +++ b/runtime/include/cafe/input.h
 @@ -20,6 +20,8 @@ struct GamepadState {
@@ -288,6 +315,41 @@ index 96b6a3a..c3d81c4 100644
  };
  
  void set_gamepad_state(const GamepadState& state);
+@@ -40,6 +42,34 @@ struct ProPadState {
+ };
+ 
+ void set_pro_pad_state(int channel, const ProPadState& state);
++
++// port/patch_wiimote.py: Wii Remotes (+ Nunchuk) on the KPAD channels 0-3, with CAFE_WIIMOTE=1.
++namespace wiimote {
++constexpr int kChannels = 4;
++// core buttons as KPAD/WPAD has them (Z and C are the Nunchuk's)
++constexpr uint32_t kLeft = 0x0001, kRight = 0x0002, kDown = 0x0004, kUp = 0x0008, kPlus = 0x0010;
++constexpr uint32_t kTwo = 0x0100, kOne = 0x0200, kB = 0x0400, kA = 0x0800, kMinus = 0x1000;
++constexpr uint32_t kZ = 0x2000, kC = 0x4000, kHome = 0x8000;
++} // namespace wiimote
++
++struct WiimoteState {
++    bool connected = false;
++    bool nunchuk = false;
++    uint32_t buttons = 0;                      // wiimote::k*
++    float acc[3] = {0.0f, -1.0f, 0.0f};        // KPAD frame, in g: lying flat, pointing at the screen
++    float nunchuk_acc[3] = {0.0f, -1.0f, 0.0f};
++    float stick_x = 0.0f, stick_y = 0.0f;      // Nunchuk, -1..1, up positive
++    bool pointer_valid = false;
++    float pointer_x = 0.0f, pointer_y = 0.0f;  // -1..1, y down
++    // port/patch_wiimote_mpls.py: MotionPlus
++    bool motion_plus = true;
++    bool real_ir = false; // from a real IR camera (emulated pointers get a 1-pixel jitter)
++    float roll = 0.0f, pitch = 0.0f;          // the remote's attitude, radians (roll right, nose up positive)
++    float gyro[3] = {0.0f, 0.0f, 0.0f};       // rev/s about x (pitch), y (yaw), z (roll)
++};
++
++bool wiimote_mode(); // CAFE_WIIMOTE=1
++void set_wiimote_state(int channel, const WiimoteState& state);
+ // The title set a Pro Controller/Wii Remote connect callback: extra host pads become its controllers.
+ bool pro_controllers_in_use();
+ 
 diff --git a/runtime/include/cafe/ppc_context.h b/runtime/include/cafe/ppc_context.h
 index a50d86d..6fe1d9c 100644
 --- a/runtime/include/cafe/ppc_context.h
@@ -301,10 +363,28 @@ index a50d86d..6fe1d9c 100644
  };
  
 diff --git a/runtime/include/cafe/ppc_ops.h b/runtime/include/cafe/ppc_ops.h
-index b4c15d8..ee32cdf 100644
+index b4c15d8..87afb2c 100644
 --- a/runtime/include/cafe/ppc_ops.h
 +++ b/runtime/include/cafe/ppc_ops.h
-@@ -150,8 +150,12 @@ inline void stsw(const PPCContext& ctx, uint8_t* base, uint32_t rs, uint32_t ea,
+@@ -25,6 +25,7 @@ extern "C" {
+ [[noreturn]] void cafe_ppc_null_call(::cafe::PPCContext& ctx, uint32_t address);
+ [[noreturn]] void cafe_ppc_bad_return(::cafe::PPCContext& ctx, uint32_t expected);
+ uint64_t cafe_ppc_timebase(void);
++void cafe_ppc_dcbf(uint32_t line_address); // port/patch_dcbf.py
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -111,6 +112,9 @@ inline uint32_t ld32_le(const uint8_t* base, uint32_t ea) { return mem::load<mem
+ inline void st16_le(uint8_t* base, uint32_t ea, uint16_t v) { mem::store<mem::u16>(base + ea, v); }
+ inline void st32_le(uint8_t* base, uint32_t ea, uint32_t v) { mem::store<mem::u32>(base + ea, v); }
+ 
++// port/patch_dcbf.py: a data cache flush = CPU-written data the GPU may hold a copy of
++inline void dcbf(uint32_t ea) { cafe_ppc_dcbf(ea & ~31u); }
++
+ inline void dcbz(uint8_t* base, uint32_t ea) {
+     uint8_t* line = base + (ea & ~31u);
+     for (int i = 0; i < 32; i += 8) mem::store<mem::u64>(line + i, uint64_t{0});
+@@ -150,8 +154,12 @@ inline void stsw(const PPCContext& ctx, uint8_t* base, uint32_t rs, uint32_t ea,
      }
  }
  
@@ -318,7 +398,7 @@ index b4c15d8..ee32cdf 100644
      uint32_t raw;
      __atomic_load(reinterpret_cast<const uint32_t*>(base + ea), &raw,
                    __ATOMIC_SEQ_CST);
-@@ -166,11 +170,21 @@ inline bool stwcx(PPCContext& ctx, uint8_t* base, uint32_t ea, uint32_t value) {
+@@ -166,11 +174,21 @@ inline bool stwcx(PPCContext& ctx, uint8_t* base, uint32_t ea, uint32_t value) {
      if (!held) {
          return false;
      }
@@ -345,7 +425,7 @@ index b4c15d8..ee32cdf 100644
  
  // ---------------------------------------------------------------------------
 diff --git a/runtime/include/cafe/runtime.h b/runtime/include/cafe/runtime.h
-index 49e556a..a61c2d4 100644
+index 49e556a..1787bb6 100644
 --- a/runtime/include/cafe/runtime.h
 +++ b/runtime/include/cafe/runtime.h
 @@ -11,6 +11,7 @@
@@ -356,25 +436,55 @@ index 49e556a..a61c2d4 100644
  
  // ---------------------------------------------------------------- memory
  // One 4 GiB host reservation mirrors the guest address space. Only committed
-@@ -41,6 +42,8 @@ std::string sha256_hex(const std::vector<uint8_t>& data);
+@@ -41,6 +42,21 @@ std::string sha256_hex(const std::vector<uint8_t>& data);
  
  // ---------------------------------------------------------------- dispatch
  void build_dispatch_table();
 +// A module's translated function, for indirect calls (port/patch_modules.py).
 +void register_guest_function(uint32_t address, PPCFunc* function);
++// port/patch_dynload_modules.py: extra room in the indirect-call table (set before main, e.g. by a
++// static initializer of a port with many modules).
++extern size_t g_dispatch_extra_entries;
++// Game modules the port loads when the title asks OSDynLoad for them (null = none).
++struct GameModuleHooks {
++    // true: name is a game module; it is loaded (entry run on first use) and *handle set.
++    bool (*acquire)(const char* name, uint32_t* handle);
++    // -1: not a game module's handle; 0: found (*address set); 1: no such export.
++    int (*find_export)(uint32_t handle, bool is_data, const char* name, uint32_t* address);
++    // true: handle was a game module's.
++    bool (*release)(uint32_t handle);
++};
++extern const GameModuleHooks* g_game_module_hooks;
  // Gives a native function a guest-visible address (for function pointers the
  // guest stores and calls, e.g. MEMAllocFromDefaultHeap's value).
  uint32_t register_host_function(PPCFunc* function, const char* name);
+diff --git a/runtime/include/cafe/vfs.h b/runtime/include/cafe/vfs.h
+index 2539381..f7e0009 100644
+--- a/runtime/include/cafe/vfs.h
++++ b/runtime/include/cafe/vfs.h
+@@ -69,6 +69,8 @@ void watch_entry_reads(std::function<void(uint32_t)> reader);
+ std::optional<std::vector<uint8_t>> read_whole(std::string_view path);
+ 
+ Status open_file(std::string_view path, std::string_view mode, int32_t& handle);
++// port/patch_fs_cwd.py: FSChangeDir's directory; guest paths without a leading '/' are below it.
++void set_cwd(std::string_view path);
+ Status close_file(int32_t handle);
+ // Reads up to `size` bytes at the file position (or at `position` when
+ // given), advancing it; `transferred` receives the byte count.
 diff --git a/runtime/src/diagnostics.cpp b/runtime/src/diagnostics.cpp
-index b5cbc80..8e32e80 100644
+index b5cbc80..38feb6d 100644
 --- a/runtime/src/diagnostics.cpp
 +++ b/runtime/src/diagnostics.cpp
-@@ -1,3 +1,4 @@
+@@ -1,6 +1,8 @@
 +#include "cafe/export.h"
  #include "cafe/generated.h"
  #include "cafe/ppc_ops.h"
  #include "cafe/runtime.h"
-@@ -89,10 +90,21 @@ void report_fault(uintptr_t host, int signal) {
++#include "gpu/gpu.h" // port/patch_dcbf.py
+ 
+ #ifdef _WIN32
+ #include <windows.h>
+@@ -89,10 +91,21 @@ void report_fault(uintptr_t host, int signal) {
      }
  }
  
@@ -396,7 +506,16 @@ index b5cbc80..8e32e80 100644
      std::fflush(stderr);
      std::_Exit(128 + signal);
  }
-@@ -234,6 +246,14 @@ void cafe_unimplemented_import(cafe::PPCContext& ctx, const char* module, const
+@@ -218,6 +231,8 @@ void cafe_ppc_bad_return(cafe::PPCContext& ctx, uint32_t expected) {
+ }
+ 
+ // The Espresso time base runs at a quarter of the 248.625 MHz bus clock.
++void cafe_ppc_dcbf(uint32_t line_address) { cafe::gpu::cpu_wrote(line_address, 32); } // port/patch_dcbf.py
++
+ uint64_t cafe_ppc_timebase(void) {
+     constexpr uint64_t kHz = 62156250;
+     static const auto start = std::chrono::steady_clock::now();
+@@ -234,6 +249,14 @@ void cafe_unimplemented_import(cafe::PPCContext& ctx, const char* module, const
      // would. Constructors and destructors leave their object in r3, queries
      // answer 0, everything else fails with an nn::Result.
      const std::string_view m = module, n = name;
@@ -412,24 +531,26 @@ index b5cbc80..8e32e80 100644
      // game says the connection could not be made.
      if (m == "nn_olv" || m == "nn_olv2" || m == "nn_boss" || m == "nn_uds") {
 diff --git a/runtime/src/dispatch.cpp b/runtime/src/dispatch.cpp
-index 0516e5a..aafd3d3 100644
+index 0516e5a..d3f38f1 100644
 --- a/runtime/src/dispatch.cpp
 +++ b/runtime/src/dispatch.cpp
-@@ -41,8 +41,11 @@ void insert(uint32_t address, PPCFunc* function, bool compiled) {
+@@ -41,8 +41,13 @@ void insert(uint32_t address, PPCFunc* function, bool compiled) {
  
  } // namespace
  
++size_t g_dispatch_extra_entries = 0x40000; // port/patch_dynload_modules.py
++
 +// port/patch_modules.py: a translated module's functions (it is loaded after the title).
 +void register_guest_function(uint32_t address, PPCFunc* function) { insert(address, function, function != nullptr); }
 +
  void build_dispatch_table() {
 -    const size_t wanted = (cafe_guest_function_count + cafe_guest_import_count + 0x10000) * 2;
-+    const size_t wanted = (cafe_guest_function_count + cafe_guest_import_count + 0x40000) * 2; // + modules
++    const size_t wanted = (cafe_guest_function_count + cafe_guest_import_count + g_dispatch_extra_entries) * 2; // + modules
      size_t capacity = 1;
      while (capacity < wanted) {
          capacity <<= 1;
 diff --git a/runtime/src/gpu/command_processor.cpp b/runtime/src/gpu/command_processor.cpp
-index eff48db..6f08c1b 100644
+index eff48db..39dbeac 100644
 --- a/runtime/src/gpu/command_processor.cpp
 +++ b/runtime/src/gpu/command_processor.cpp
 @@ -26,6 +26,18 @@
@@ -616,6 +737,19 @@ index eff48db..6f08c1b 100644
  }
  
  uint64_t clock() { return cafe_ppc_timebase(); }
+@@ -634,6 +747,12 @@ uint64_t clock() { return cafe_ppc_timebase(); }
+ void cpu_wrote(uint32_t address, uint32_t size) {
+     if (size == 0) return;
+     std::lock_guard lock(g_written_mutex);
++    // port/patch_dcbf.py: a flush loop (dcbf line by line) continues the previous range
++    if (!g_written.empty() && uint64_t{g_written.back().first} + g_written.back().second == address &&
++        g_written.back().second < (1u << 20)) {
++        g_written.back().second += size;
++        return;
++    }
+     g_written.emplace_back(address, size);
+ }
+ 
 diff --git a/runtime/src/gpu/display.cpp b/runtime/src/gpu/display.cpp
 index a91815d..2a7ac24 100644
 --- a/runtime/src/gpu/display.cpp
@@ -2683,10 +2817,26 @@ index e403aff..4cde864 100644
  CAFE_EXPORT(gx2, GX2ExpandDepthBuffer, GX2ExpandDepthBuffer);
  CAFE_EXPORT(gx2, GX2ConvertDepthBufferToTextureSurface, GX2ConvertDepthBufferToTextureSurface);
 diff --git a/runtime/src/host/window.cpp b/runtime/src/host/window.cpp
-index 7d7dddc..e8689eb 100644
+index 7d7dddc..1fa0fcf 100644
 --- a/runtime/src/host/window.cpp
 +++ b/runtime/src/host/window.cpp
-@@ -195,6 +195,25 @@ float axis(SDL_Gamepad* pad, SDL_GamepadAxis a) {
+@@ -10,6 +10,15 @@
+ #include <SDL3/SDL.h>
+ #include <SDL3/SDL_vulkan.h>
+ 
++#ifdef __linux__ // port/patch_wiimote.py: real Wii Remotes through evdev
++#include <dirent.h>
++#include <fcntl.h>
++#include <linux/input.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++#include <cerrno>
++#endif
++
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
+@@ -195,6 +204,25 @@ float axis(SDL_Gamepad* pad, SDL_GamepadAxis a) {
      return std::fabs(v) < 0.15f ? 0.0f : std::clamp(v, -1.0f, 1.0f);
  }
  
@@ -2712,7 +2862,344 @@ index 7d7dddc..e8689eb 100644
  OverlayHooks g_overlay;
  std::atomic<bool> g_quit_requested{false};
  
-@@ -327,6 +346,26 @@ void update_input() {
+@@ -282,13 +310,324 @@ void update_virtual_pads() {
+     }
+ }
+ 
++// ------------------------------------------------- port/patch_wiimote.py
++// A host pad as a Wii Remote held upright with a Nunchuk (see the patch's header for the buttons).
++struct PadMotion {
++    double shake_phase = 0.0, nunchuk_phase = 0.0;
++    float tilt_x = 0.0f, tilt_y = 0.0f;
++    float pointer_x = 0.0f, pointer_y = 0.0f;
++    double pointer_until = 0.0; // the pointer stays on the screen this long after the stick moved
++    float last_roll = 0.0f, last_pitch = 0.0f; // port/patch_wiimote_mpls.py
++};
++
++// port/patch_wiimote_mpls.py: MotionPlus switch and the attitude from gravity (a remote at rest)
++bool wiimote_mplus() {
++    static const bool on = [] {
++        const char* v = std::getenv("CAFE_WIIMOTE_MPLUS");
++        return v == nullptr || *v != '0';
++    }();
++    return on;
++}
++void attitude_from_acc(os::WiimoteState& w) {
++    w.pitch = std::asin(std::clamp(w.acc[2] / std::max(0.2f, std::sqrt(w.acc[0] * w.acc[0] + w.acc[1] * w.acc[1] + w.acc[2] * w.acc[2])), -1.0f, 1.0f));
++    w.roll = std::atan2(w.acc[0], -w.acc[1]);
++}
++std::array<PadMotion, os::wiimote::kChannels> g_pad_motion;
++
++os::WiimoteState wiimote_from_pad(SDL_Gamepad* pad, PadMotion& m, float dt) {
++    os::WiimoteState w;
++    w.connected = true;
++    w.nunchuk = true;
++    struct Map { SDL_GamepadButton button; uint32_t bit; };
++    static constexpr Map kMap[] = {
++        {SDL_GAMEPAD_BUTTON_EAST, os::wiimote::kA},       {SDL_GAMEPAD_BUTTON_SOUTH, os::wiimote::kB},
++        {SDL_GAMEPAD_BUTTON_WEST, os::wiimote::kOne},     {SDL_GAMEPAD_BUTTON_NORTH, os::wiimote::kTwo},
++        {SDL_GAMEPAD_BUTTON_DPAD_UP, os::wiimote::kUp},   {SDL_GAMEPAD_BUTTON_DPAD_DOWN, os::wiimote::kDown},
++        {SDL_GAMEPAD_BUTTON_DPAD_LEFT, os::wiimote::kLeft}, {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, os::wiimote::kRight},
++        {SDL_GAMEPAD_BUTTON_START, os::wiimote::kPlus},   {SDL_GAMEPAD_BUTTON_BACK, os::wiimote::kMinus},
++        {SDL_GAMEPAD_BUTTON_GUIDE, os::wiimote::kHome},   {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, os::wiimote::kC},
++    };
++    for (const Map& b : kMap) {
++        if (SDL_GetGamepadButton(pad, b.button)) w.buttons |= b.bit;
++    }
++    if (axis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 0.5f) w.buttons |= os::wiimote::kZ;
++    w.stick_x = axis(pad, SDL_GAMEPAD_AXIS_LEFTX);
++    w.stick_y = -axis(pad, SDL_GAMEPAD_AXIS_LEFTY);
++    const float rx = axis(pad, SDL_GAMEPAD_AXIS_RIGHTX), ry = axis(pad, SDL_GAMEPAD_AXIS_RIGHTY);
++    const bool tilting = axis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 0.5f;
++    // tilt: eases towards the stick (a hand does not turn instantly); up = nose up, right = roll right
++    const float ease = std::min(1.0f, dt * 12.0f);
++    m.tilt_x += ((tilting ? rx : 0.0f) - m.tilt_x) * ease;
++    m.tilt_y += ((tilting ? -ry : 0.0f) - m.tilt_y) * ease;
++    const float roll = m.tilt_x * 1.3f, pitch = m.tilt_y * 1.3f; // up to ~75 degrees
++    w.acc[0] = std::sin(roll) * std::cos(pitch);
++    w.acc[1] = -std::cos(roll) * std::cos(pitch);
++    w.acc[2] = std::sin(pitch);
++    // the pointer: on the screen while the right stick is moved and 3 s after (else "pointing away", so menus
++    // stay in D-pad mode); the stick's position is the pointer's
++    const double now = SDL_GetTicks() / 1000.0;
++    if (!tilting && (rx != 0.0f || ry != 0.0f)) {
++        m.pointer_x = rx;
++        m.pointer_y = ry;
++        m.pointer_until = now + 3.0;
++    }
++    w.pointer_valid = now < m.pointer_until;
++    w.pointer_x = m.pointer_x;
++    w.pointer_y = m.pointer_y;
++    // port/patch_wiimote_mpls.py: attitude and turn rate from the tilt
++    w.motion_plus = wiimote_mplus();
++    w.roll = roll;
++    w.pitch = pitch;
++    if (dt > 0.0f) {
++        constexpr float kTurn = 1.0f / (2.0f * 3.14159265f);
++        w.gyro[0] = (pitch - m.last_pitch) / dt * kTurn;
++        w.gyro[2] = (roll - m.last_roll) / dt * kTurn;
++    }
++    m.last_roll = roll;
++    m.last_pitch = pitch;
++    // shaking: ~6 swings a second, 2.5 g up/down and back/forth
++    if (SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER)) {
++        w.gyro[0] += 1.5f * static_cast<float>(std::cos(m.shake_phase)); // the swing turns the remote too
++        m.shake_phase += dt * 6.0 * 2.0 * 3.14159265;
++        w.acc[1] += 2.5f * static_cast<float>(std::sin(m.shake_phase));
++        w.acc[2] += 1.5f * static_cast<float>(std::cos(m.shake_phase));
++    } else {
++        m.shake_phase = 0.0;
++    }
++    if (SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_RIGHT_STICK)) {
++        m.nunchuk_phase += dt * 6.0 * 2.0 * 3.14159265;
++        w.nunchuk_acc[1] += 2.5f * static_cast<float>(std::sin(m.nunchuk_phase));
++        w.nunchuk_acc[2] += 1.5f * static_cast<float>(std::cos(m.nunchuk_phase));
++    } else {
++        m.nunchuk_phase = 0.0;
++    }
++    return w;
++}
++
++#ifdef __linux__
++// Real Wii Remotes through the kernel driver hid-wiimote: it makes one evdev device per part
++// ("Nintendo Wii Remote", "... Accelerometer", "... IR", "... Nunchuk"), the same uniq (address) on all.
++// The accelerometer and IR camera only run while their device is open.
++struct RealRemote {
++    std::string uniq;
++    int keys = -1, accel = -1, ir = -1, nunchuk = -1, mp = -1; // mp: port/patch_wiimote_mpls.py
++    float mp_raw[3] = {0, 0, 0};
++    os::WiimoteState state;
++    float ir_x[4] = {1023, 1023, 1023, 1023}, ir_y[4] = {1023, 1023, 1023, 1023};
++    float acc_raw[3] = {0, 0, 100}, nunchuk_raw[3] = {0, 0, 100};
++};
++std::vector<RealRemote> g_real_remotes;
++
++void close_remote(RealRemote& r) {
++    for (int* fd : {&r.keys, &r.accel, &r.ir, &r.nunchuk, &r.mp}) {
++        if (*fd >= 0) close(*fd);
++        *fd = -1;
++    }
++}
++
++void scan_real_remotes() {
++    static const bool off = std::getenv("CAFE_WIIMOTE_NO_EVDEV") != nullptr;
++    static double next_scan = 0.0;
++    const double now = SDL_GetTicks() / 1000.0;
++    if (off || now < next_scan) return;
++    next_scan = now + 2.0;
++    DIR* dir = opendir("/dev/input");
++    if (dir == nullptr) return;
++    std::vector<std::string> seen_paths;
++    while (dirent* e = readdir(dir)) {
++        if (std::strncmp(e->d_name, "event", 5) != 0) continue;
++        const std::string path = std::string("/dev/input/") + e->d_name;
++        bool known = false; // a device already held: its path is behind one of our descriptors
++        for (const RealRemote& x : g_real_remotes) {
++            for (int fd : {x.keys, x.accel, x.ir, x.nunchuk, x.mp}) {
++                char link[64] = {};
++                if (fd >= 0 && readlink(("/proc/self/fd/" + std::to_string(fd)).c_str(), link, sizeof link - 1) > 0)
++                    known = known || path == link;
++            }
++        }
++        if (known) continue;
++        const int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
++        if (fd < 0) continue;
++        char name[128] = {}, uniq[64] = {};
++        ioctl(fd, EVIOCGNAME(sizeof name - 1), name);
++        if (ioctl(fd, EVIOCGUNIQ(sizeof uniq - 1), uniq) < 0 || uniq[0] == '\0') ioctl(fd, EVIOCGPHYS(sizeof uniq - 1), uniq);
++        const std::string n = name;
++        if (n.rfind("Nintendo Wii Remote", 0) != 0 || n.find("Pro Controller") != std::string::npos ||
++            n.find("Balance") != std::string::npos || n.find("Classic") != std::string::npos) {
++            close(fd);
++            continue;
++        }
++        RealRemote* r = nullptr;
++        for (RealRemote& x : g_real_remotes) r = x.uniq == uniq ? &x : r;
++        if (r == nullptr) {
++            g_real_remotes.push_back({uniq});
++            r = &g_real_remotes.back();
++        }
++        int* slot = n == "Nintendo Wii Remote" ? &r->keys : n.find("Accelerometer") != std::string::npos ? &r->accel
++                  : n.find(" IR") != std::string::npos ? &r->ir : n.find("Nunchuk") != std::string::npos ? &r->nunchuk
++                  : n.find("Motion Plus") != std::string::npos ? &r->mp : nullptr;
++        if (slot == nullptr || *slot >= 0) {
++            close(fd);
++            continue;
++        }
++        *slot = fd;
++        std::fprintf(stderr, "ttt2: wiimote: %s (%s) = %s\n", name, uniq, path.c_str());
++    }
++    closedir(dir);
++}
++
++// Reads what the remotes sent; a remote whose main device went away is dropped.
++void read_real_remotes() {
++    scan_real_remotes();
++    for (RealRemote& r : g_real_remotes) {
++        os::WiimoteState& w = r.state;
++        auto drain = [&](int& fd, auto&& on_event) {
++            if (fd < 0) return;
++            input_event ev[64];
++            for (;;) {
++                const ssize_t n = read(fd, ev, sizeof ev);
++                if (n < 0 && errno == ENODEV) { close(fd); fd = -1; return; }
++                if (n <= 0) return;
++                for (ssize_t i = 0; i < n / static_cast<ssize_t>(sizeof(input_event)); ++i) on_event(ev[i]);
++            }
++        };
++        drain(r.keys, [&](const input_event& e) {
++            if (e.type != EV_KEY) return;
++            uint32_t bit = 0;
++            switch (e.code) {
++            case KEY_LEFT: bit = os::wiimote::kLeft; break;
++            case KEY_RIGHT: bit = os::wiimote::kRight; break;
++            case KEY_UP: bit = os::wiimote::kUp; break;
++            case KEY_DOWN: bit = os::wiimote::kDown; break;
++            case KEY_NEXT: bit = os::wiimote::kPlus; break;
++            case KEY_PREVIOUS: bit = os::wiimote::kMinus; break;
++            case BTN_1: bit = os::wiimote::kOne; break;
++            case BTN_2: bit = os::wiimote::kTwo; break;
++            case BTN_A: bit = os::wiimote::kA; break;
++            case BTN_B: bit = os::wiimote::kB; break;
++            case BTN_MODE: bit = os::wiimote::kHome; break;
++            default: return;
++            }
++            if (e.value) w.buttons |= bit;
++            else w.buttons &= ~bit;
++        });
++        drain(r.accel, [&](const input_event& e) {
++            if (e.type == EV_ABS && e.code >= ABS_RX && e.code <= ABS_RZ) r.acc_raw[e.code - ABS_RX] = static_cast<float>(e.value);
++        });
++        drain(r.nunchuk, [&](const input_event& e) {
++            if (e.type == EV_ABS && e.code >= ABS_RX && e.code <= ABS_RZ) r.nunchuk_raw[e.code - ABS_RX] = static_cast<float>(e.value);
++            if (e.type == EV_ABS && e.code == ABS_HAT0X) w.stick_x = std::clamp(e.value / 100.0f, -1.0f, 1.0f);
++            if (e.type == EV_ABS && e.code == ABS_HAT0Y) w.stick_y = std::clamp(e.value / 100.0f, -1.0f, 1.0f);
++            if (e.type == EV_KEY && (e.code == BTN_C || e.code == BTN_Z)) {
++                const uint32_t bit = e.code == BTN_C ? os::wiimote::kC : os::wiimote::kZ;
++                if (e.value) w.buttons |= bit;
++                else w.buttons &= ~bit;
++            }
++        });
++        drain(r.ir, [&](const input_event& e) {
++            if (e.type != EV_ABS || e.code < ABS_HAT0X || e.code > ABS_HAT3Y) return;
++            const int k = (e.code - ABS_HAT0X) / 2;
++            ((e.code - ABS_HAT0X) % 2 ? r.ir_y : r.ir_x)[k] = static_cast<float>(e.value);
++        });
++        drain(r.mp, [&](const input_event& e) { // port/patch_wiimote_mpls.py
++            if (e.type == EV_ABS && e.code >= ABS_RX && e.code <= ABS_RZ) r.mp_raw[e.code - ABS_RX] = static_cast<float>(e.value);
++        });
++        // sensor axes (x left, y forward, z up; ~100 per g) -> KPAD frame (as Nintendo's KPAD converts them)
++        constexpr float kPerG = 100.0f;
++        w.acc[0] = -r.acc_raw[0] / kPerG;
++        w.acc[1] = -r.acc_raw[2] / kPerG;
++        w.acc[2] = r.acc_raw[1] / kPerG;
++        w.nunchuk = r.nunchuk >= 0;
++        if (!w.nunchuk) w.buttons &= ~(os::wiimote::kC | os::wiimote::kZ);
++        w.nunchuk_acc[0] = -r.nunchuk_raw[0] / kPerG;
++        w.nunchuk_acc[1] = -r.nunchuk_raw[2] / kPerG;
++        w.nunchuk_acc[2] = r.nunchuk_raw[1] / kPerG;
++        // pointer: the middle of the first two dots the camera sees (1024x768; 1023 = none)
++        float sx = 0, sy = 0;
++        int dots = 0;
++        for (int k = 0; k < 4 && dots < 2; ++k) {
++            if (r.ir_x[k] >= 1023 || r.ir_y[k] >= 1023) continue;
++            sx += r.ir_x[k];
++            sy += r.ir_y[k];
++            ++dots;
++        }
++        static const char* flip = std::getenv("CAFE_WIIMOTE_IR_FLIP");
++        w.pointer_valid = dots > 0;
++        w.real_ir = true;
++        if (dots > 0) {
++            w.pointer_x = (512.0f - sx / dots) / 512.0f; // the camera sees the bar move the other way
++            w.pointer_y = (sy / dots - 384.0f) / 384.0f;
++            if (flip && std::strchr(flip, 'x')) w.pointer_x = -w.pointer_x;
++            if (flip && std::strchr(flip, 'y')) w.pointer_y = -w.pointer_y;
++        }
++        // port/patch_wiimote_mpls.py: attitude from gravity, turn rate from the Motion Plus (yaw, roll, pitch order)
++        attitude_from_acc(w);
++        w.motion_plus = wiimote_mplus();
++        if (r.mp >= 0) {
++            static const float units = [] {
++                const char* v = std::getenv("CAFE_WIIMOTE_GYRO_UNITS");
++                return v ? static_cast<float>(std::atof(v)) : 248.0f;
++            }();
++            const float to_rev = 1.0f / (units * 360.0f);
++            w.gyro[1] = r.mp_raw[0] * to_rev;
++            w.gyro[2] = r.mp_raw[1] * to_rev;
++            w.gyro[0] = r.mp_raw[2] * to_rev;
++        }
++        w.connected = r.keys >= 0;
++        if (!w.connected) close_remote(r);
++    }
++    std::erase_if(g_real_remotes, [](const RealRemote& r) { return r.keys < 0 && r.accel < 0 && r.ir < 0 && r.nunchuk < 0; });
++}
++#endif
++
++// Real remotes first, then host pads by slot. Returns which host pads became remotes.
++void update_wiimotes(const SDL_JoystickID* ids, int count, std::vector<SDL_JoystickID>& as_remote) {
++    static auto last = std::chrono::steady_clock::now();
++    const auto now = std::chrono::steady_clock::now();
++    const float dt = std::clamp(std::chrono::duration<float>(now - last).count(), 0.0f, 0.1f);
++    last = now;
++    std::array<os::WiimoteState, os::wiimote::kChannels> states{};
++    int channel = 0;
++#ifdef __linux__
++    read_real_remotes();
++    for (const RealRemote& r : g_real_remotes) {
++        if (channel < os::wiimote::kChannels && r.state.connected) states[channel++] = r.state;
++    }
++#endif
++    const int real = channel;
++    for (size_t slot = 0; slot < g_pad_slots.size() && channel < os::wiimote::kChannels; ++slot) {
++        const SDL_JoystickID id = g_pad_slots[slot];
++        if (id == 0 || id == kGuestSlot || std::find(ids, ids + count, id) == ids + count) continue;
++        SDL_Gamepad* pad = SDL_GetGamepadFromID(id);
++        if (pad == nullptr) continue;
++        const char* name = SDL_GetGamepadName(pad);
++        if (real > 0 && name && std::strstr(name, "Wii Remote")) continue; // read directly above
++        states[channel] = wiimote_from_pad(pad, g_pad_motion[channel], dt);
++        ++channel;
++        as_remote.push_back(id);
++    }
++    static const bool scripted = std::getenv("TTT2_INPUT_SCRIPT") != nullptr;
++    if (channel == 0 && scripted) { // unattended runs: remote 0 exists for the script (os/input.cpp)
++        states[0].connected = true;
++        states[0].nunchuk = true; // its pointer: "t:touch=x/y/s" (os/input.cpp)
++    }
++    for (int c = 0; c < os::wiimote::kChannels; ++c) os::set_wiimote_state(c, states[c]);
++}
++
+ void update_input() {
+     update_virtual_pads();
+     os::GamepadState state{};
+-    const bool pros = os::pro_controllers_in_use();
++    const bool wiimotes = os::wiimote_mode(); // port/patch_wiimote.py
++    const bool pros = os::pro_controllers_in_use() && !wiimotes;
+     int count = 0;
+     SDL_JoystickID* ids = SDL_GetGamepads(&count);
+-    if (pros) assign_pad_slots(ids, count);
++    if (pros || wiimotes) assign_pad_slots(ids, count);
++    std::vector<SDL_JoystickID> as_remote;
++    static const bool remote_drives_gamepad = [] {
++        const char* v = std::getenv("CAFE_WIIMOTE_GAMEPAD");
++        return v == nullptr || *v != '0';
++    }();
++    if (wiimotes) update_wiimotes(ids, count, as_remote);
+     os::ProPadState channels[os::pro::kChannels]{};
+     for (int c = 0; c < os::pro::kChannels; ++c) channels[c].connected = g_pad_slots[c + 1] != 0;
+     if (g_overlay.captures && g_overlay.captures()) { // still connected, nothing pressed
+@@ -308,6 +647,9 @@ void update_input() {
+         SDL_Gamepad* pad = SDL_GetGamepadFromID(ids[i]);
+         if (pad == nullptr) pad = SDL_OpenGamepad(ids[i]);
+         if (pad == nullptr) continue;
++        if (wiimotes && std::find(as_remote.begin(), as_remote.end(), ids[i]) != as_remote.end() &&
++            (!remote_drives_gamepad || ids[i] != g_pad_slots[0])) continue; // port/patch_wiimote.py
++        if (wiimotes && SDL_GetGamepadName(pad) && std::strstr(SDL_GetGamepadName(pad), "Wii Remote")) continue;
+         if (pros) {
+             const auto slot = std::find(g_pad_slots.begin(), g_pad_slots.end(), ids[i]) - g_pad_slots.begin();
+             if (slot >= static_cast<ptrdiff_t>(g_pad_slots.size())) continue; // a ninth pad
+@@ -327,6 +669,26 @@ void update_input() {
          state.right_y = std::clamp(state.right_y - axis(pad, SDL_GAMEPAD_AXIS_RIGHTY), -1.0f, 1.0f);
      }
      SDL_free(ids);
@@ -2739,7 +3226,7 @@ index 7d7dddc..e8689eb 100644
      for (int c = 0; pros && c < os::pro::kChannels; ++c) netplay::remote_pad(c, channels[c]);
      os::set_gamepad_state(state);
      for (int c = 0; pros && c < os::pro::kChannels; ++c) os::set_pro_pad_state(c, channels[c]);
-@@ -458,6 +497,8 @@ bool run_event_loop(const std::function<bool()>& finished) {
+@@ -458,6 +820,8 @@ bool run_event_loop(const std::function<bool()>& finished) {
                  if (event.key.scancode == SDL_SCANCODE_F12 && !event.key.repeat) gpu::request_frame_trace();
                  // F10: profile the next ten seconds (profile-<n>.txt beside the executable).
                  if (event.key.scancode == SDL_SCANCODE_F10 && !event.key.repeat) os::request_profile();
@@ -2748,7 +3235,7 @@ index 7d7dddc..e8689eb 100644
                  break;
              case SDL_EVENT_GAMEPAD_BUTTON_DOWN: {
                  // Both sticks clicked: F12 from a pad, mid-fight.
-@@ -466,6 +507,31 @@ bool run_event_loop(const std::function<bool()>& finished) {
+@@ -466,6 +830,31 @@ bool run_event_loop(const std::function<bool()>& finished) {
                                                                                                        : SDL_GAMEPAD_BUTTON_INVALID;
                  SDL_Gamepad* pad = SDL_GetGamepadFromID(event.gbutton.which);
                  if (other != SDL_GAMEPAD_BUTTON_INVALID && pad && SDL_GetGamepadButton(pad, other)) gpu::request_frame_trace();
@@ -2780,7 +3267,7 @@ index 7d7dddc..e8689eb 100644
                  break;
              }
              default: break;
-@@ -479,6 +545,9 @@ bool run_event_loop(const std::function<bool()>& finished) {
+@@ -479,6 +868,9 @@ bool run_event_loop(const std::function<bool()>& finished) {
      return true;
  }
  
@@ -3383,8 +3870,30 @@ index cec93d5..5217d87 100644
  void reserve_guest_memory() {
      if (g_base != nullptr) {
          return;
+diff --git a/runtime/src/os/alarm.cpp b/runtime/src/os/alarm.cpp
+index ec0c7ac..2080905 100644
+--- a/runtime/src/os/alarm.cpp
++++ b/runtime/src/os/alarm.cpp
+@@ -18,6 +18,7 @@
+ extern "C" uint64_t cafe_ppc_timebase(void);
+ 
+ namespace cafe::os {
++int64_t os_time_offset(); // port/patch_periodic_alarm.py
+ 
+ Thread* create_internal_thread(const char* name, int core);
+ 
+@@ -119,6 +120,9 @@ bool OSSetAlarm(GuestAddress alarm, uint64_t delay, uint32_t handler) {
+ 
+ // First fire at `start` (system ticks), then every `period` ticks.
+ bool OSSetPeriodicAlarm(GuestAddress alarm, uint64_t start, uint64_t period, uint32_t handler) {
++    // port/patch_periodic_alarm.py: an OSTime start (from OSGetTime) to the system time base
++    const int64_t offset = os_time_offset();
++    if (offset > 0 && start >= static_cast<uint64_t>(offset)) start -= static_cast<uint64_t>(offset);
+     uint64_t when = start;
+     const uint64_t now = cafe_ppc_timebase();
+     if (period != 0 && when < now) when += (now - when + period - 1) / period * period;
 diff --git a/runtime/src/os/ax.cpp b/runtime/src/os/ax.cpp
-index efe3675..6df66b3 100644
+index efe3675..a03b91b 100644
 --- a/runtime/src/os/ax.cpp
 +++ b/runtime/src/os/ax.cpp
 @@ -81,6 +81,7 @@ struct Voice {
@@ -3455,7 +3964,7 @@ index efe3675..6df66b3 100644
  void set_voice_ve(uint32_t vpb, uint16_t volume, int16_t delta) {
      std::lock_guard lock(g_ax_mutex);
      if (Voice* v = voice_of(vpb)) {
-@@ -630,6 +648,132 @@ void set_voice_ve(uint32_t vpb, uint16_t volume, int16_t delta) {
+@@ -630,7 +648,134 @@ void set_voice_ve(uint32_t vpb, uint16_t volume, int16_t delta) {
      }
  }
  
@@ -3586,8 +4095,10 @@ index efe3675..6df66b3 100644
 +CAFE_EXPORT(snd_core, AXGetDeviceFinalMixCallback, AXGetDeviceFinalMixCallback);
 +
  CAFE_EXPORT(snd_core, AXInit, AXInit);
++CAFE_EXPORT(snd_core, AXInitWithParams, AXInit); // port/patch_heap_more.py
  CAFE_EXPORT(snd_core, AXQuit, AXQuit);
  CAFE_EXPORT(snd_core, AXIsInit, AXIsInit);
+ CAFE_EXPORT(snd_core, AXAcquireVoice, AXAcquireVoice);
 diff --git a/runtime/src/os/ax.h b/runtime/src/os/ax.h
 index 0205845..c55d43d 100644
 --- a/runtime/src/os/ax.h
@@ -3602,7 +4113,7 @@ index 0205845..c55d43d 100644
 +
  } // namespace cafe::os
 diff --git a/runtime/src/os/coreinit_misc.cpp b/runtime/src/os/coreinit_misc.cpp
-index 50b2c1e..0faaa54 100644
+index 50b2c1e..704f519 100644
 --- a/runtime/src/os/coreinit_misc.cpp
 +++ b/runtime/src/os/coreinit_misc.cpp
 @@ -2,6 +2,7 @@
@@ -3623,11 +4134,113 @@ index 50b2c1e..0faaa54 100644
  void DCInvalidateRange(uint32_t, uint32_t) {}
  void DCZeroRange(GuestAddress address, uint32_t size) {
      const uint32_t begin = address.value & ~31u;
+@@ -551,4 +553,6 @@ static void init_stdio_cleanup(uint32_t address) { g_stdio_cleanup = address; }
+ CAFE_DATA_EXPORT(coreinit, __atexit_cleanup, init_atexit_cleanup);
+ CAFE_DATA_EXPORT(coreinit, __stdio_cleanup, init_stdio_cleanup);
+ 
++// port/patch_periodic_alarm.py: OSGetTime minus the system time base.
++int64_t os_time_offset() { return ticks_since_2000() - static_cast<int64_t>(cafe_ppc_timebase()); }
+ } // namespace cafe::os
+diff --git a/runtime/src/os/dynload.cpp b/runtime/src/os/dynload.cpp
+index 83aa787..8bcb2b0 100644
+--- a/runtime/src/os/dynload.cpp
++++ b/runtime/src/os/dynload.cpp
+@@ -2,6 +2,8 @@
+ // answered from the runtime's export registry.
+ 
+ #include "kernel.h"
++#include <cstdio>
++#include <cstdlib>
+ 
+ #include "cafe/export.h"
+ #include "cafe/runtime.h"
+@@ -12,6 +14,10 @@
+ #include <map>
+ #include <string>
+ 
++namespace cafe {
++const GameModuleHooks* g_game_module_hooks = nullptr; // port/patch_dynload_modules.py
++}
++
+ namespace cafe::os {
+ namespace {
+ 
+@@ -32,9 +38,18 @@ void unimplemented_dynamic_export(PPCContext& ctx, uint8_t*) {
+ }
+ 
+ uint32_t OSDynLoad_Acquire(uint32_t name, be<uint32_t>* handle) {
++    if (g_game_module_hooks != nullptr && name != 0) { // port/patch_dynload_modules.py
++        uint32_t h = 0;
++        const std::string wanted(guest_string(name));
++        if (g_game_module_hooks->acquire(wanted.c_str(), &h)) {
++            if (handle) *handle = h;
++            return 0;
++        }
++    }
+     KernelLock lock(kernel_mutex());
+     std::string module(guest_string(name));
+     if (module.size() > 4 && module.compare(module.size() - 4, 4, ".rpl") == 0) module.resize(module.size() - 4);
++    if (std::getenv("TTT2_TRACE_DYNLOAD")) std::fprintf(stderr, "dynload: acquire %s\n", module.c_str()); // port/patch_dynload_trace.py
+     for (const auto& [h, m] : g_modules) {
+         if (m == module) {
+             if (handle) *handle = h;
+@@ -49,11 +64,22 @@ uint32_t OSDynLoad_Acquire(uint32_t name, be<uint32_t>* handle) {
+ }
+ 
+ uint32_t OSDynLoad_FindExport(uint32_t handle, uint32_t is_data, uint32_t name, be<uint32_t>* address) {
++    if (g_game_module_hooks != nullptr && name != 0) { // port/patch_dynload_modules.py
++        uint32_t a = 0;
++        const std::string wanted(guest_string(name));
++        const int r = g_game_module_hooks->find_export(handle, is_data != 0, wanted.c_str(), &a);
++        if (r == 0) {
++            if (address) *address = a;
++            return 0;
++        }
++        if (r == 1) return 0xBAD10001u; // OSDynLoad: export not found
++    }
+     KernelLock lock(kernel_mutex());
+     const auto module = g_modules.find(handle);
+     if (module == g_modules.end()) return kError;
+     const std::string symbol(guest_string(name));
+     const std::string key = module->second + ":" + symbol;
++    if (std::getenv("TTT2_TRACE_DYNLOAD")) std::fprintf(stderr, "dynload: find %s%s\n", key.c_str(), is_data ? " (data)" : ""); // port/patch_dynload_trace.py
+     if (is_data) {
+         auto it = g_data_objects.find(key);
+         if (it == g_data_objects.end()) {
+@@ -85,7 +111,9 @@ uint32_t OSDynLoad_FindExport(uint32_t handle, uint32_t is_data, uint32_t name,
+     return 0;
+ }
+ 
+-void OSDynLoad_Release(uint32_t) {}
++void OSDynLoad_Release(uint32_t handle) {
++    if (g_game_module_hooks != nullptr) g_game_module_hooks->release(handle); // port/patch_dynload_modules.py
++}
+ 
+ // Modules are not loaded into guest memory, so the allocator is never used.
+ uint32_t OSDynLoad_SetAllocator(uint32_t, uint32_t) { return 0; }
 diff --git a/runtime/src/os/fs.cpp b/runtime/src/os/fs.cpp
-index 404cc34..99fdabc 100644
+index 404cc34..690a354 100644
 --- a/runtime/src/os/fs.cpp
 +++ b/runtime/src/os/fs.cpp
-@@ -334,6 +334,56 @@ int32_t FSGetStatAsync(PPCContext& ctx, GuestAddress client, GuestAddress block,
+@@ -306,7 +306,16 @@ int32_t complete_async(PPCContext& ctx, GuestAddress client, GuestAddress block,
+     if (!async) return status;
+     const uint32_t callback = async[0], param = async[1], queue = async[2];
+     if (callback != 0) {
+-        call_guest(ctx, callback, {client.value, block.value, static_cast<uint32_t>(status), param});
++        // port/patch_fs_async_defer.py: later, from another thread, as the console does.
++        static const bool sync = std::getenv("TTT2_FS_SYNC_CALLBACK") != nullptr;
++        if (sync) {
++            call_guest(ctx, callback, {client.value, block.value, static_cast<uint32_t>(status), param});
++        } else {
++            const uint32_t c = client.value, b = block.value, s = static_cast<uint32_t>(status);
++            defer_guest_work([callback, c, b, s, param](PPCContext& context) {
++                call_guest(context, callback, {c, b, s, param});
++            });
++        }
+     } else if (queue != 0) {
+         const uint32_t result = block.value + kAsyncResultOffset;
+         auto* words = guest<be<uint32_t>>(result);
+@@ -334,6 +343,56 @@ int32_t FSGetStatAsync(PPCContext& ctx, GuestAddress client, GuestAddress block,
                         uint32_t mask, const be<uint32_t>* async) {
      return complete_async(ctx, client, block, FSGetStat(client, block, path, out, mask), async);
  }
@@ -3684,7 +4297,7 @@ index 404cc34..99fdabc 100644
  // The FSAsyncResult of a completion message from a queue: the message's data word.
  uint32_t FSGetAsyncResult(const be<uint32_t>* message) { return message ? uint32_t{message[0]} : 0u; }
  // Writes go to the host file as they happen; nothing waits in a cache.
-@@ -392,6 +442,11 @@ CAFE_EXPORT(coreinit, FSCloseDir, FSCloseDir);
+@@ -392,6 +451,17 @@ CAFE_EXPORT(coreinit, FSCloseDir, FSCloseDir);
  CAFE_EXPORT(nn_save, SAVEInit, SAVEInit);
  CAFE_EXPORT(nn_save, SAVEShutdown, SAVEShutdown);
  CAFE_EXPORT(nn_save, SAVEInitSaveDir, SAVEInitSaveDir);
@@ -3693,10 +4306,16 @@ index 404cc34..99fdabc 100644
 +    return complete_async(ctx, client, block, SAVEOpenFile(client, block, slot, path, mode, handle, mask), async);
 +}
 +CAFE_EXPORT(nn_save, SAVEOpenFileAsync, SAVEOpenFileAsync);
++// port/patch_save_flush_async.py
++static int32_t SAVEFlushQuotaAsync(PPCContext& ctx, GuestAddress client, GuestAddress block, uint8_t, uint32_t,
++                                   const be<uint32_t>* async) {
++    return complete_async(ctx, client, block, 0, async);
++}
++CAFE_EXPORT(nn_save, SAVEFlushQuotaAsync, SAVEFlushQuotaAsync);
  CAFE_EXPORT(nn_save, SAVEOpenFile, SAVEOpenFile);
  CAFE_EXPORT(nn_save, SAVEMakeDir, SAVEMakeDir);
  CAFE_EXPORT(nn_save, SAVEGetSharedDataTitlePath, SAVEGetSharedDataTitlePath);
-@@ -407,6 +462,16 @@ CAFE_EXPORT(coreinit, FSOpenFileAsync, FSOpenFileAsync);
+@@ -407,6 +477,16 @@ CAFE_EXPORT(coreinit, FSOpenFileAsync, FSOpenFileAsync);
  CAFE_EXPORT(coreinit, FSCloseFileAsync, FSCloseFileAsync);
  CAFE_EXPORT(coreinit, FSGetStatAsync, FSGetStatAsync);
  CAFE_EXPORT(coreinit, FSGetAsyncResult, FSGetAsyncResult);
@@ -3714,10 +4333,156 @@ index 404cc34..99fdabc 100644
  CAFE_EXPORT(coreinit, FSRemove, FSRemove);
  CAFE_EXPORT(coreinit, FSRename, FSRename);
 diff --git a/runtime/src/os/heap.cpp b/runtime/src/os/heap.cpp
-index 552bb84..213f326 100644
+index 552bb84..d1234df 100644
 --- a/runtime/src/os/heap.cpp
 +++ b/runtime/src/os/heap.cpp
-@@ -303,6 +303,15 @@ uint32_t MEMGetTotalFreeSizeForExpHeap(uint32_t heap) {
+@@ -17,6 +17,10 @@
+ #include <memory>
+ #include <mutex>
+ #include <unordered_map>
++#include <vector>    // port/patch_heap_more.py
++#include <algorithm> // port/patch_heap_trace.py
++#include <cstdio>
++#include <cstdlib>
+ 
+ namespace cafe::os {
+ 
+@@ -47,8 +51,77 @@ std::unordered_map<uint32_t, std::unique_ptr<FrameHeap>> g_frame_heaps;
+ uint32_t g_base_heaps[9]; // MEMGetBaseHeapHandle arenas: 0 MEM1, 1 MEM2, 8 FG
+ 
+ uint32_t align_up(uint32_t v, uint32_t a) { return (v + a - 1) & ~(a - 1); }
++
++// port/patch_heap_trace.py: TTT2_TRACE_HEAP=LO-HI
++void trace_heap(const char* what, uint32_t heap, uint32_t a, uint32_t b) {
++    static const std::pair<uint32_t, uint32_t> range = [] {
++        const char* v = std::getenv("TTT2_TRACE_HEAP");
++        if (v == nullptr) return std::pair<uint32_t, uint32_t>{0, 0};
++        char* end = nullptr;
++        const uint32_t lo = static_cast<uint32_t>(std::strtoul(v, &end, 16));
++        const uint32_t hi = end && *end == '-' ? static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 16)) : lo + 1;
++        return std::pair<uint32_t, uint32_t>{lo, hi};
++    }();
++    if (range.second == 0) return;
++    const uint32_t lo = std::min(a, b), hi = std::max(a, b) + 1;
++    if (hi <= range.first || lo >= range.second) return;
++    const uint32_t lr = current_thread() ? static_cast<uint32_t>(current_thread()->ctx.lr) : 0;
++    std::fprintf(stderr, "heap: %s heap %08X %08X %08X lr %08X\n", what, heap, a, b, lr);
++}
+ uint32_t align_down(uint32_t v, uint32_t a) { return v & ~(a - 1); }
+ 
++// port/patch_heap_headers.py: MEMHeapHeader in guest memory. Offsets: 0x04 link {prev, next}, 0x0C child list
++// {head, tail, u16 count, u16 offset}, 0x18 dataStart, 0x1C dataEnd. Children are linked through their link field.
++struct HeapRange { uint32_t start, end, parent; };
++std::map<uint32_t, HeapRange> g_heap_ranges; // handle -> data range and parent heap (0: none)
++
++void put32(uint32_t address, uint32_t value) { *guest<be<uint32_t>>(address) = value; }
++uint32_t get32(uint32_t address) { return *guest<be<uint32_t>>(address); }
++
++// The innermost heap whose data range holds [start, end), or 0.
++uint32_t containing_heap(uint32_t start, uint32_t end, uint32_t self) {
++    uint32_t best = 0, best_size = 0xFFFFFFFFu;
++    for (const auto& [handle, r] : g_heap_ranges) {
++        if (handle == self || start < r.start || end > r.end) continue;
++        if (r.end - r.start < best_size) {
++            best = handle;
++            best_size = r.end - r.start;
++        }
++    }
++    return best;
++}
++
++void register_heap(uint32_t handle, uint32_t data_start, uint32_t data_end) {
++    for (uint32_t o = 0x04; o < 0x18; o += 4) put32(handle + o, 0);
++    *guest<be<uint16_t>>(handle + 0x16) = 4; // the children's link offset
++    put32(handle + 0x18, data_start);
++    put32(handle + 0x1C, data_end);
++    const uint32_t parent = containing_heap(handle, data_end, handle);
++    g_heap_ranges[handle] = {data_start, data_end, parent};
++    if (parent == 0) return;
++    const uint32_t tail = get32(parent + 0x10);
++    put32(handle + 0x04, tail); // prev
++    put32(handle + 0x08, 0);    // next
++    if (tail) put32(tail + 0x08, handle);
++    else put32(parent + 0x0C, handle);
++    put32(parent + 0x10, handle);
++    *guest<be<uint16_t>>(parent + 0x14) = static_cast<uint16_t>(*guest<be<uint16_t>>(parent + 0x14) + 1);
++}
++
++void unregister_heap(uint32_t handle) {
++    const auto it = g_heap_ranges.find(handle);
++    if (it == g_heap_ranges.end()) return;
++    const uint32_t parent = it->second.parent;
++    g_heap_ranges.erase(it);
++    if (parent == 0 || g_heap_ranges.find(parent) == g_heap_ranges.end()) return;
++    const uint32_t prev = get32(handle + 0x04), next = get32(handle + 0x08);
++    if (prev) put32(prev + 0x08, next);
++    else put32(parent + 0x0C, next);
++    if (next) put32(next + 0x04, prev);
++    else put32(parent + 0x10, prev);
++    *guest<be<uint16_t>>(parent + 0x14) = static_cast<uint16_t>(*guest<be<uint16_t>>(parent + 0x14) - 1);
++}
++
+ // The free list, by address and by size: allocations take the smallest block
+ // that fits (best fit) in log time instead of walking the list.
+ void add_free(ExpHeap& heap, uint32_t start, uint32_t size) {
+@@ -69,6 +142,7 @@ uint32_t create_exp_heap(uint32_t start, uint32_t size) {
+     heap->begin = begin + kHeaderSize;
+     heap->end = end;
+     add_free(*heap, heap->begin, end - heap->begin);
++    register_heap(begin, heap->begin, end); // port/patch_heap_headers.py
+     g_exp_heaps[begin] = std::move(heap);
+     return begin;
+ }
+@@ -144,29 +218,37 @@ uint32_t create_frame_heap(uint32_t start, uint32_t size) {
+     *guest<be<uint32_t>>(begin) = kFrmMagic;
+     g_frame_heaps[begin] = std::make_unique<FrameHeap>(
+         FrameHeap{begin + kHeaderSize, end, begin + kHeaderSize, end});
++    register_heap(begin, begin + kHeaderSize, end); // port/patch_heap_headers.py
+     return begin;
+ }
+ 
+ // ------------------------------------------------------------------ exports
+ uint32_t MEMCreateExpHeapEx(GuestAddress start, uint32_t size, uint32_t) {
+     std::lock_guard lock(g_heap_mutex);
++    trace_heap("create exp", 0, start.value, start.value + size); // port/patch_heap_trace.py
+     return create_exp_heap(start.value, size);
+ }
+ 
+ GuestAddress MEMDestroyExpHeap(GuestAddress heap) {
+     std::lock_guard lock(g_heap_mutex);
++    if (const auto it = g_exp_heaps.find(heap.value); it != g_exp_heaps.end()) // port/patch_heap_trace.py
++        trace_heap("destroy exp", heap.value, it->second->begin, it->second->end);
++    unregister_heap(heap.value); // port/patch_heap_headers.py
+     g_exp_heaps.erase(heap.value);
+     return heap;
+ }
+ 
+ uint32_t MEMAllocFromExpHeapEx(uint32_t heap, uint32_t size, int32_t alignment) {
+     std::lock_guard lock(g_heap_mutex);
+-    return exp_alloc(exp_heap(heap), size, alignment);
++    const uint32_t payload = exp_alloc(exp_heap(heap), size, alignment);
++    trace_heap("alloc exp", heap, payload, payload + size); // port/patch_heap_trace.py
++    return payload;
+ }
+ 
+ void MEMFreeToExpHeap(uint32_t heap, uint32_t payload) {
+     if (payload == 0) return;
+     std::lock_guard lock(g_heap_mutex);
++    trace_heap("free exp", heap, payload, payload); // port/patch_heap_trace.py
+     exp_free(exp_heap(heap), payload);
+ }
+ 
+@@ -288,6 +370,9 @@ void run_preinit_user(PPCContext& ctx, uint32_t function) {
+     g_base_heaps[1] = __builtin_bswap32(guest[2]);
+ }
+ 
++// port/patch_find_contain_heap.py
++uint32_t MEMFindContainHeap(uint32_t pointer) { return containing_heap(pointer, pointer + 1, 0); }
++CAFE_EXPORT(coreinit, MEMFindContainHeap, MEMFindContainHeap);
+ CAFE_EXPORT(coreinit, MEMCreateExpHeapEx, MEMCreateExpHeapEx);
+ CAFE_EXPORT(coreinit, MEMDestroyExpHeap, MEMDestroyExpHeap);
+ CAFE_EXPORT(coreinit, MEMAllocFromExpHeapEx, MEMAllocFromExpHeapEx);
+@@ -303,6 +388,15 @@ uint32_t MEMGetTotalFreeSizeForExpHeap(uint32_t heap) {
  
  // shortcut: allocations always come first-fit; honour the mode if a title depends on placement.
  uint32_t MEMSetAllocModeForExpHeap(uint32_t, uint32_t) { return 0; }
@@ -3733,7 +4498,7 @@ index 552bb84..213f326 100644
  
  uint32_t MEMGetAllocatableSizeForFrmHeapEx(uint32_t handle, int32_t alignment) {
      std::lock_guard lock(g_heap_mutex);
-@@ -324,9 +333,32 @@ void MEMFreeToAllocator(PPCContext& ctx, GuestAddress allocator, uint32_t block)
+@@ -324,10 +418,104 @@ void MEMFreeToAllocator(PPCContext& ctx, GuestAddress allocator, uint32_t block)
      call_guest(ctx, *guest<be<uint32_t>>(functions + 4), {allocator.value, block});
  }
  
@@ -3764,32 +4529,111 @@ index 552bb84..213f326 100644
  CAFE_EXPORT(coreinit, MEMSetAllocModeForExpHeap, MEMSetAllocModeForExpHeap);
 +CAFE_EXPORT(coreinit, MEMGetSizeForMBlockExpHeap, MEMGetSizeForMBlockExpHeap);
  CAFE_EXPORT(coreinit, MEMGetAllocatableSizeForFrmHeapEx, MEMGetAllocatableSizeForFrmHeapEx);
++// ---------------------------------------------------------------- port/patch_heap_more.py
++uint32_t exp_allocator_alloc(GuestAddress allocator, uint32_t size) {
++    const uint32_t heap = *guest<be<uint32_t>>(allocator.value + 4);
++    const int32_t alignment = static_cast<int32_t>(static_cast<uint32_t>(*guest<be<uint32_t>>(allocator.value + 8)));
++    return MEMAllocFromExpHeapEx(heap, size, alignment);
++}
++void exp_allocator_free(GuestAddress allocator, uint32_t block) {
++    MEMFreeToExpHeap(*guest<be<uint32_t>>(allocator.value + 4), block);
++}
++void thunk_exp_allocator_alloc(PPCContext& ctx, uint8_t*) { abi::invoke<exp_allocator_alloc>(ctx); }
++void thunk_exp_allocator_free(PPCContext& ctx, uint8_t*) { abi::invoke<exp_allocator_free>(ctx); }
++void MEMInitAllocatorForExpHeap(GuestAddress allocator, uint32_t heap, int32_t alignment) {
++    static uint32_t functions = 0;
++    if (functions == 0) {
++        functions = system_alloc(8, 4);
++        guest<be<uint32_t>>(functions)[0] = register_host_function(thunk_exp_allocator_alloc, "allocator: expanded heap alloc");
++        guest<be<uint32_t>>(functions)[1] = register_host_function(thunk_exp_allocator_free, "allocator: expanded heap free");
++    }
++    auto* a = guest<be<uint32_t>>(allocator.value);
++    a[0] = functions;
++    a[1] = heap;
++    a[2] = static_cast<uint32_t>(alignment);
++    a[3] = 0;
++}
++
++uint32_t MEMResizeForMBlockExpHeap(uint32_t handle, uint32_t payload, uint32_t size) {
++    std::lock_guard lock(g_heap_mutex);
++    ExpHeap& heap = exp_heap(handle);
++    const auto it = heap.used.find(payload);
++    if (it == heap.used.end()) return 0;
++    size = align_up(size == 0 ? 1 : size, 4);
++    uint32_t& end = it->second.second;
++    const uint32_t wanted = payload + size;
++    if (wanted <= end) { // shrink: the rest goes back (joined with a free block right after)
++        if (end - wanted >= kBlockHeader + 4) {
++            uint32_t free_start = wanted, free_end = end;
++            auto next = heap.free.find(end);
++            if (next != heap.free.end()) {
++                free_end += next->second;
++                remove_free(heap, next);
++            }
++            add_free(heap, free_start, free_end - free_start);
++            end = wanted;
++        }
++        return end - payload;
++    }
++    auto next = heap.free.find(end);
++    if (next == heap.free.end() || uint64_t{end} + next->second < wanted) return 0;
++    const uint32_t free_end = next->first + next->second;
++    remove_free(heap, next);
++    if (free_end - wanted >= kBlockHeader + 4) {
++        add_free(heap, wanted, free_end - wanted);
++        end = wanted;
++    } else {
++        end = free_end;
++    }
++    return end - payload;
++}
++
++void MEMVisitAllocatedForExpHeap(PPCContext& ctx, uint32_t handle, uint32_t visitor, uint32_t param) {
++    std::vector<uint32_t> blocks;
++    {
++        std::lock_guard lock(g_heap_mutex);
++        for (const auto& [payload, range] : exp_heap(handle).used) blocks.push_back(payload);
++    }
++    for (const uint32_t block : blocks) call_guest(ctx, visitor, {block, handle, param});
++}
++
++CAFE_EXPORT(coreinit, MEMInitAllocatorForExpHeap, MEMInitAllocatorForExpHeap);
++CAFE_EXPORT(coreinit, MEMResizeForMBlockExpHeap, MEMResizeForMBlockExpHeap);
++CAFE_EXPORT(coreinit, MEMVisitAllocatedForExpHeap, MEMVisitAllocatedForExpHeap);
  CAFE_EXPORT(coreinit, MEMAllocFromAllocator, MEMAllocFromAllocator);
  CAFE_EXPORT(coreinit, MEMFreeToAllocator, MEMFreeToAllocator);
+ CAFE_DATA_EXPORT(coreinit, MEMAllocFromDefaultHeap, init_alloc_pointer);
 diff --git a/runtime/src/os/input.cpp b/runtime/src/os/input.cpp
-index a861ac3..1600830 100644
+index a861ac3..96fd9a1 100644
 --- a/runtime/src/os/input.cpp
 +++ b/runtime/src/os/input.cpp
-@@ -8,6 +8,7 @@
+@@ -8,6 +8,8 @@
  #include "cafe/input.h"
  #include "cafe/vfs.h"
  
 +#include <algorithm> // port/patch_touch_ui.py
++#include <cmath>     // port/patch_wiimote.py
  #include <array>
  #include <cstdio>
  #include <chrono>
-@@ -53,6 +54,7 @@ struct StickHold {
+@@ -53,6 +55,8 @@ struct StickHold {
  struct Script {
      std::vector<ScriptedPress> presses;
      std::vector<StickHold> sticks;
 +    std::vector<StickHold> touches; // port/patch_touch_ui.py: "t:touch=x/y/seconds"
++    std::vector<StickHold> tilts;   // port/patch_wiimote_mpls.py: "t:tilt=roll/pitch/seconds" (degrees)
      std::vector<uint32_t> anchors;
      std::mutex mutex;
      std::vector<double> starts; // each segment's start, after start-up; < 0 while waiting
-@@ -91,6 +93,11 @@ Script& load_script() {
+@@ -91,6 +95,16 @@ Script& load_script() {
                  std::sscanf(name.c_str() + 6, "%lf/%lf/%lf", &x, &y, &duration);
                  script.sticks.push_back({std::atof(item.substr(0, colon).c_str()), x, y, duration, script.anchors.size()});
              }
++            if (name.rfind("tilt=", 0) == 0) { // port/patch_wiimote_mpls.py
++                double roll = 0, pitch = 0, duration = 0.2;
++                std::sscanf(name.c_str() + 5, "%lf/%lf/%lf", &roll, &pitch, &duration);
++                script.tilts.push_back({std::atof(item.substr(0, colon).c_str()), roll, pitch, duration, script.anchors.size()});
++            }
 +            if (name.rfind("touch=", 0) == 0) {
 +                double x = 0.5, y = 0.5, duration = 0.2;
 +                std::sscanf(name.c_str() + 6, "%lf/%lf/%lf", &x, &y, &duration);
@@ -3798,10 +4642,26 @@ index a861ac3..1600830 100644
              const size_t equals = name.find('=');
              for (const auto& [n, bit] : kNames) {
                  if (name.substr(0, equals) == n) {
-@@ -164,6 +171,22 @@ bool scripted_stick(float& x, float& y) {
+@@ -164,6 +178,38 @@ bool scripted_stick(float& x, float& y) {
      return false;
  }
  
++// port/patch_wiimote_mpls.py: a scripted tilt of Wii Remote 0 (radians), if one is under way.
++bool scripted_tilt(float& roll, float& pitch) {
++    static Script& script = load_script();
++    if (script.tilts.empty()) return false;
++    const double t = seconds_since(script.start);
++    std::lock_guard lock(script.mutex);
++    for (const StickHold& h : script.tilts) {
++        const double start = script.starts[h.segment];
++        if (start < 0.0 || t < start + h.at || t >= start + h.at + h.duration) continue;
++        roll = static_cast<float>(h.x * 3.14159265 / 180.0);
++        pitch = static_cast<float>(h.y * 3.14159265 / 180.0);
++        return true;
++    }
++    return false;
++}
++
 +// port/patch_touch_ui.py: a scripted touch, if one is under way.
 +bool scripted_touch(float& x, float& y) {
 +    static Script& script = load_script();
@@ -3821,13 +4681,51 @@ index a861ac3..1600830 100644
  // ------------------------------------------------------------ the + chord
  // See arm_start_chord. A press of + waits kChordFrames armings (the mode's
  // frames, so slow frames wait longer): the mode sees a button two or three
-@@ -349,6 +372,17 @@ int32_t VPADRead(int32_t channel, VPADStatus* status, uint32_t count, be<int32_t
+@@ -327,6 +373,24 @@ struct VPADStatus {
+ };
+ static_assert(sizeof(VPADStatus) == 0xAC);
+ 
++// TTT2_INPUT_SCRIPT presses (taken in VPADRead) reach Wii Remote 0 too: A B X=1 Y=2, D-pad, + - HOME,
++// ZL = Z, L = C, R = shake the remote, ZR = shake the Nunchuk; the scripted stick is the Nunchuk's.
++uint32_t g_script_vpad = 0;
++float g_script_stick[2] = {0.0f, 0.0f};
++bool g_script_stick_on = false;
++
++uint32_t script_wiimote_buttons(uint32_t v) {
++    static const std::pair<uint32_t, uint32_t> kMap[] = {
++        {vpad::kA, wiimote::kA}, {vpad::kB, wiimote::kB}, {vpad::kX, wiimote::kOne}, {vpad::kY, wiimote::kTwo},
++        {vpad::kUp, wiimote::kUp}, {vpad::kDown, wiimote::kDown}, {vpad::kLeft, wiimote::kLeft},
++        {vpad::kRight, wiimote::kRight}, {vpad::kPlus, wiimote::kPlus}, {vpad::kMinus, wiimote::kMinus},
++        {vpad::kHome, wiimote::kHome}, {vpad::kZL, wiimote::kZ}, {vpad::kL, wiimote::kC},
++    };
++    uint32_t out = 0;
++    for (const auto& [from, to] : kMap) out |= (v & from) ? to : 0;
++    return out;
++}
++
+ void VPADInit() {}
+ 
+ void deliver_connects();
+@@ -340,7 +404,11 @@ int32_t VPADRead(int32_t channel, VPADStatus* status, uint32_t count, be<int32_t
+     std::lock_guard lock(g_input_mutex);
+     std::memset(status, 0, sizeof(VPADStatus));
+     const GamepadState pad = pad_for_read(g_gamepad);
+-    const uint32_t hold = gate_start(pad.buttons | scripted_buttons());
++    const uint32_t scripted = scripted_buttons(); // port/patch_wiimote.py: also Wii Remote 0's
++    static const bool remote_only = std::getenv("TTT2_SCRIPT_REMOTE_ONLY") != nullptr; // script presses: remote 0 only
++    const uint32_t hold = gate_start(pad.buttons | (remote_only ? 0u : scripted));
++    g_script_vpad = scripted;
++    g_script_stick_on = scripted_stick(g_script_stick[0], g_script_stick[1]);
+     status->hold = hold;
+     status->trigger = hold & ~g_previous_hold;
+     status->release = g_previous_hold & ~hold;
+@@ -349,6 +417,17 @@ int32_t VPADRead(int32_t channel, VPADStatus* status, uint32_t count, be<int32_t
      scripted_stick(left_x, left_y);
      status->left_stick = {left_x, left_y};
      status->right_stick = {pad.right_x, pad.right_y};
 +    { // port/patch_touch_ui.py: touch in the calibrated 1280x720 space
 +        float tx = pad.touch_x, ty = pad.touch_y;
-+        const bool touched = scripted_touch(tx, ty) || pad.touch;
++        const bool touched = (!remote_only && scripted_touch(tx, ty)) || pad.touch; // port/patch_wiimote.py
 +        if (touched) {
 +            const TouchData t{static_cast<uint16_t>(std::clamp(tx, 0.0f, 1.0f) * 1279.0f + 0.5f),
 +                              static_cast<uint16_t>(std::clamp(ty, 0.0f, 1.0f) * 719.0f + 0.5f), uint16_t{1}, uint16_t{0}};
@@ -3839,11 +4737,262 @@ index a861ac3..1600830 100644
      // A GamePad lying flat and still: gravity on -Z (in g), identity frame.
      status->acceleration = {0.0f, 0.0f, -1.0f};
      status->acc_magnitude = 1.0f;
+@@ -380,6 +459,13 @@ constexpr int32_t kWpadNoController = -1;
+ constexpr uint8_t kExtProController = 0x1F, kNoDevice = 0xFD;
+ 
+ struct ProChannel {
++    WiimoteState wiimote{}; // port/patch_wiimote.py: this channel is a Wii Remote (wiimote.connected)
++    uint8_t mpls_mode = 0;  // port/patch_wiimote_mpls.py: KPADEnableMpls' mode (4 alone, 5 Nunchuk, 7 Classic)
++    float mp_angle[3] = {0.0f, 0.0f, 0.0f};
++    std::chrono::steady_clock::time_point mp_last{};
++    uint8_t wm_traced_type = 0xFF;
++    uint32_t wm_previous = 0;
++    float wm_acc[3] = {0.0f, -1.0f, 0.0f}, wm_nunchuk_acc[3] = {0.0f, -1.0f, 0.0f}, wm_pos[2] = {0.0f, 0.0f};
+     ProPadState host{};     // as the host has it
+     bool connected = false; // as the title has it
+     bool dropped = false;   // the title disconnected it
+@@ -432,6 +518,121 @@ uint32_t KPADSetConnectCallback(uint32_t channel, uint32_t callback) {
+     g_pro[channel].callback = callback;
+     return previous;
+ }
++// port/patch_wiimote.py: a Wii Remote's sample. Extension types: 0 remote, 1 + Nunchuk.
++constexpr uint8_t kExtCore = 0, kExtNunchuk = 1;
++uint8_t wiimote_type(const ProChannel& c) {
++    if (c.wiimote.motion_plus && c.mpls_mode != 0) { // port/patch_wiimote_mpls.py: 5 MotionPlus, 6 + Nunchuk, 7 + Classic
++        if (c.mpls_mode == 7) return 7;
++        return c.mpls_mode == 5 && c.wiimote.nunchuk ? 6 : 5;
++    }
++    return c.wiimote.nunchuk ? kExtNunchuk : kExtCore;
++}
++
++void put_f(KPADStatus* s, size_t offset, float v) {
++    *reinterpret_cast<be<float>*>(reinterpret_cast<uint8_t*>(s) + offset) = v;
++}
++
++void fill_wiimote(ProChannel& c, KPADStatus* status) {
++    WiimoteState w = c.wiimote;
++    if (&c == &g_pro[0]) {
++        w.buttons |= script_wiimote_buttons(g_script_vpad);
++        if (g_script_stick_on) {
++            w.stick_x = g_script_stick[0];
++            w.stick_y = g_script_stick[1];
++        }
++        float tx = 0.0f, ty = 0.0f; // a scripted touch ("t:touch=x/y/s") also points remote 0 there
++        if (scripted_touch(tx, ty)) {
++            w.pointer_valid = true;
++            w.pointer_x = tx * 2.0f - 1.0f;
++            w.pointer_y = ty * 2.0f - 1.0f;
++        }
++        float roll = 0.0f, pitch = 0.0f; // port/patch_wiimote_mpls.py
++        if (scripted_tilt(roll, pitch)) {
++            const float a[3] = {std::sin(roll) * std::cos(pitch), -std::cos(roll) * std::cos(pitch), std::sin(pitch)};
++            for (int i = 0; i < 3; ++i) w.acc[i] = w.nunchuk_acc[i] = a[i];
++            w.roll = roll;
++            w.pitch = pitch;
++        }
++        static int phase = 0;
++        if (g_script_vpad & (vpad::kR | vpad::kZR)) {
++            ++phase;
++            float* a = (g_script_vpad & vpad::kR) ? w.acc : w.nunchuk_acc;
++            a[1] += 2.5f * std::sin(phase * 0.6f);
++            a[2] += 1.5f * std::cos(phase * 0.6f);
++        }
++    }
++    static const bool trace = std::getenv("TTT2_TRACE_WIIMOTE") != nullptr;
++    if (trace && (w.buttons != c.wm_previous || wiimote_type(c) != c.wm_traced_type)) {
++        std::fprintf(stderr, "wiimote: ch %d hold %04X type %u acc %.2f %.2f %.2f\n", static_cast<int>(&c - g_pro), w.buttons,
++                     wiimote_type(c), w.acc[0], w.acc[1], w.acc[2]);
++        c.wm_traced_type = wiimote_type(c);
++    }
++    status->hold = w.buttons;
++    status->trigger = w.buttons & ~c.wm_previous;
++    status->release = c.wm_previous & ~w.buttons;
++    c.wm_previous = w.buttons;
++    const auto length = [](const float* v) { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); };
++    const float variation = std::sqrt((w.acc[0] - c.wm_acc[0]) * (w.acc[0] - c.wm_acc[0]) +
++                                      (w.acc[1] - c.wm_acc[1]) * (w.acc[1] - c.wm_acc[1]) +
++                                      (w.acc[2] - c.wm_acc[2]) * (w.acc[2] - c.wm_acc[2]));
++    for (int i = 0; i < 3; ++i) put_f(status, 0x0C + 4 * i, w.acc[i]);
++    put_f(status, 0x18, length(w.acc));
++    put_f(status, 0x1C, variation);
++    if (w.pointer_valid && !w.real_ir) { // a hand is never perfectly still: +-1 pixel
++        static uint32_t jitter = 0;
++        w.pointer_x += (++jitter & 1) ? 0.003f : -0.003f;
++    }
++    if (w.pointer_valid) {
++        put_f(status, 0x20, w.pointer_x);
++        put_f(status, 0x24, w.pointer_y);
++        put_f(status, 0x28, w.pointer_x - c.wm_pos[0]);
++        put_f(status, 0x2C, w.pointer_y - c.wm_pos[1]);
++        put_f(status, 0x30, std::hypot(w.pointer_x - c.wm_pos[0], w.pointer_y - c.wm_pos[1]));
++        put_f(status, 0x48, 1.0f); // distance to the sensor bar, metres
++        c.wm_pos[0] = w.pointer_x;
++        c.wm_pos[1] = w.pointer_y;
++    }
++    // horizon: the roll as a unit vector (x right, y down), from gravity in the x/y plane
++    const float roll = std::hypot(w.acc[0], w.acc[1]);
++    put_f(status, 0x34, roll > 0.0f ? -w.acc[1] / roll : 1.0f);
++    put_f(status, 0x38, roll > 0.0f ? w.acc[0] / roll : 0.0f);
++    const float vertical = std::hypot(w.acc[1], w.acc[2]);
++    put_f(status, 0x54, vertical > 0.0f ? -w.acc[2] / vertical : 0.0f);
++    put_f(status, 0x58, vertical > 0.0f ? -w.acc[1] / vertical : 1.0f);
++    std::memcpy(c.wm_acc, w.acc, sizeof c.wm_acc);
++    status->extension_type = wiimote_type(c);
++    status->error = 0;
++    status->pos_valid = w.pointer_valid ? 1 : 0;
++    status->format = w.nunchuk ? 5 : 2; // NUNCHUK_ACC_DPD / CORE_ACC_DPD
++    if (status->extension_type >= 5 && status->extension_type <= 7) { // port/patch_wiimote_mpls.py
++        const auto now = std::chrono::steady_clock::now();
++        const float dt = c.mp_last == std::chrono::steady_clock::time_point{} ? 0.0f
++                       : std::clamp(std::chrono::duration<float>(now - c.mp_last).count(), 0.0f, 0.1f);
++        c.mp_last = now;
++        for (int i = 0; i < 3; ++i) {
++            c.mp_angle[i] += w.gyro[i] * dt;
++            put_f(status, 0xB0 + 4 * i, w.gyro[i]);
++            put_f(status, 0xBC + 4 * i, c.mp_angle[i]);
++        }
++        // attitude M = Rx(pitch) * Rz(-roll): its columns are the remote's x, y, z axes on the KPAD frame
++        const float cp = std::cos(w.pitch), sp = std::sin(w.pitch), cr = std::cos(w.roll), sr = std::sin(w.roll);
++        const float m[3][3] = {{cr, sr, 0.0f}, {-cp * sr, cp * cr, -sp}, {-sp * sr, sp * cr, cp}};
++        for (int axis = 0; axis < 3; ++axis) {
++            for (int k = 0; k < 3; ++k) put_f(status, 0xC8 + 12 * axis + 4 * k, m[k][axis]);
++        }
++    }
++    if (w.nunchuk && (status->extension_type == kExtNunchuk || status->extension_type == 6)) {
++        put_f(status, 0x60, w.stick_x);
++        put_f(status, 0x64, w.stick_y);
++        for (int i = 0; i < 3; ++i) put_f(status, 0x68 + 4 * i, w.nunchuk_acc[i]);
++        put_f(status, 0x74, length(w.nunchuk_acc));
++        float v = 0.0f;
++        for (int i = 0; i < 3; ++i) v += (w.nunchuk_acc[i] - c.wm_nunchuk_acc[i]) * (w.nunchuk_acc[i] - c.wm_nunchuk_acc[i]);
++        put_f(status, 0x78, std::sqrt(v));
++        std::memcpy(c.wm_nunchuk_acc, w.nunchuk_acc, sizeof c.wm_nunchuk_acc);
++    }
++}
++
+ int32_t KPADReadEx(int32_t channel, KPADStatus* status, uint32_t count, be<int32_t>* error) {
+     std::lock_guard lock(g_input_mutex);
+     if (channel < 0 || channel >= pro::kChannels || !g_pro[channel].connected || status == nullptr || count == 0) {
+@@ -440,6 +641,11 @@ int32_t KPADReadEx(int32_t channel, KPADStatus* status, uint32_t count, be<int32
+     }
+     ProChannel& c = g_pro[channel];
+     std::memset(status, 0, sizeof(KPADStatus));
++    if (c.wiimote.connected) { // port/patch_wiimote.py
++        fill_wiimote(c, status);
++        if (error) *error = 0;
++        return 1;
++    }
+     status->extension_type = kExtProController;
+     status->pro_hold = c.host.buttons;
+     status->pro_trigger = c.host.buttons & ~c.previous;
+@@ -453,9 +659,42 @@ int32_t KPADReadEx(int32_t channel, KPADStatus* status, uint32_t count, be<int32
+ int32_t WPADProbe(int32_t channel, be<uint32_t>* type) {
+     std::lock_guard lock(g_input_mutex);
+     const bool connected = channel >= 0 && channel < pro::kChannels && g_pro[channel].connected;
+-    if (type) *type = connected ? kExtProController : kNoDevice;
++    if (type) *type = !connected ? kNoDevice : g_pro[channel].wiimote.connected ? wiimote_type(g_pro[channel]) : kExtProController;
+     return connected ? 0 : kWpadNoController;
+ }
++// port/patch_wiimote_mpls.py: MotionPlus on and off, and its state
++void KPADEnableMpls(int32_t channel, uint32_t mode) {
++    if (channel < 0 || channel >= wiimote::kChannels) return;
++    std::lock_guard lock(g_input_mutex);
++    static const bool trace = std::getenv("TTT2_TRACE_WIIMOTE") != nullptr;
++    if (trace) std::fprintf(stderr, "wiimote: KPADEnableMpls(%d, %u)\n", channel, mode);
++    g_pro[channel].mpls_mode = static_cast<uint8_t>(mode);
++    for (float& a : g_pro[channel].mp_angle) a = 0.0f;
++}
++void KPADDisableMpls(int32_t channel) { KPADEnableMpls(channel, 0); }
++uint32_t KPADGetMplsStatus(int32_t channel) {
++    if (channel < 0 || channel >= wiimote::kChannels) return 0;
++    std::lock_guard lock(g_input_mutex);
++    const ProChannel& c = g_pro[channel];
++    return c.connected && c.wiimote.connected && c.wiimote.motion_plus ? c.mpls_mode : 0;
++}
++void KPADResetMpls(int32_t channel) {
++    if (channel < 0 || channel >= wiimote::kChannels) return;
++    std::lock_guard lock(g_input_mutex);
++    for (float& a : g_pro[channel].mp_angle) a = 0.0f;
++}
++int32_t WPADIsMplsAttached(int32_t channel, be<uint32_t>* attached, uint32_t) {
++    std::lock_guard lock(g_input_mutex);
++    const bool on = channel >= 0 && channel < wiimote::kChannels && g_pro[channel].connected &&
++                    g_pro[channel].wiimote.connected && g_pro[channel].wiimote.motion_plus;
++    if (attached) *attached = on ? 1 : 0;
++    return on ? 0 : kWpadNoController;
++}
++float KPADWorkMplsCalibration(int32_t) { return 0.0f; } // what is left to do: none (Sochi waits for |x| < 0.0001)
++
++int32_t KPADRead(int32_t channel, KPADStatus* status, uint32_t count) { // port/patch_wiimote.py
++    return KPADReadEx(channel, status, count, nullptr);
++}
+ void WPADRead(int32_t, uint8_t* status) {
+     if (status) std::memset(status, 0, 0x2A);
+ }
+@@ -504,6 +743,36 @@ void set_pro_pad_state(int channel, const ProPadState& state) {
+     }
+ }
+ 
++// port/patch_wiimote.py
++bool wiimote_mode() {
++    static const bool on = [] {
++        const char* v = std::getenv("CAFE_WIIMOTE");
++        return v != nullptr && *v != '\0' && *v != '0';
++    }();
++    return on;
++}
++
++void set_wiimote_state(int channel, const WiimoteState& state) {
++    if (channel < 0 || channel >= wiimote::kChannels) return;
++    std::lock_guard lock(g_input_mutex);
++    ProChannel& c = g_pro[channel];
++    const bool was = c.connected;
++    const bool type_changed = was && c.wiimote.connected && state.connected && c.wiimote.nunchuk != state.nunchuk;
++    c.wiimote = state;
++    if (!state.connected) {
++        c.dropped = false;
++        if (was) g_pending_connects.push_back({channel, kWpadNoController});
++        c.connected = false;
++    } else if (!was && (!c.dropped || state.buttons != 0)) {
++        c.connected = true;
++        c.dropped = false;
++        c.wm_previous = state.buttons;
++        g_pending_connects.push_back({channel, 0});
++    } else if (type_changed) { // a Nunchuk plugged in or out: the title probes again
++        g_pending_connects.push_back({channel, 0});
++    }
++}
++
+ bool pro_controllers_in_use() {
+     std::lock_guard lock(g_input_mutex);
+     for (const ProChannel& c : g_pro) {
+@@ -539,6 +808,13 @@ CAFE_EXPORT(padscore, KPADInit, KPADInit);
+ CAFE_EXPORT(padscore, KPADShutdown, KPADShutdown);
+ CAFE_EXPORT(padscore, KPADSetConnectCallback, KPADSetConnectCallback);
+ CAFE_EXPORT(padscore, KPADReadEx, KPADReadEx);
++CAFE_EXPORT(padscore, KPADRead, KPADRead); // port/patch_wiimote.py
++CAFE_EXPORT(padscore, KPADEnableMpls, KPADEnableMpls); // port/patch_wiimote_mpls.py
++CAFE_EXPORT(padscore, KPADDisableMpls, KPADDisableMpls);
++CAFE_EXPORT(padscore, KPADGetMplsStatus, KPADGetMplsStatus);
++CAFE_EXPORT(padscore, KPADResetMpls, KPADResetMpls);
++CAFE_EXPORT(padscore, WPADIsMplsAttached, WPADIsMplsAttached);
++CAFE_EXPORT(padscore, KPADWorkMplsCalibration, KPADWorkMplsCalibration);
+ CAFE_EXPORT(padscore, WPADProbe, WPADProbe);
+ CAFE_EXPORT(padscore, WPADRead, WPADRead);
+ CAFE_EXPORT(padscore, WPADSetDataFormat, WPADSetDataFormat);
 diff --git a/runtime/src/os/kernel.h b/runtime/src/os/kernel.h
-index a3de794..be75f9c 100644
+index a3de794..f72abe1 100644
 --- a/runtime/src/os/kernel.h
 +++ b/runtime/src/os/kernel.h
-@@ -60,6 +60,7 @@ struct Thread {
+@@ -8,6 +8,7 @@
+ // structures keep the state games can observe (owner, counts, flags); host
+ // structures keep what only the runtime needs.
+ 
++#include <functional>
+ #include "cafe/guest.h"
+ #include "cafe/ppc_context.h"
+ 
+@@ -60,6 +61,7 @@ struct Thread {
      pthread_t host{};
      bool host_started = false;
      bool finished = false; // entry returned or OSExitThread ran
@@ -3851,6 +5000,15 @@ index a3de794..be75f9c 100644
      bool interrupts_disabled = false;
      int core = 1;
      std::jmp_buf exit_jump{};
+@@ -67,6 +69,8 @@ struct Thread {
+ 
+ // The kernel lock, held while any kernel object is examined or changed.
+ std::mutex& kernel_mutex();
++// port/patch_fs_async_defer.py: runs `work` on the runtime's system guest thread, later.
++void defer_guest_work(std::function<void(PPCContext&)> work);
+ using KernelLock = std::unique_lock<std::mutex>;
+ 
+ Thread* current_thread();
 diff --git a/runtime/src/os/nn_services.cpp b/runtime/src/os/nn_services.cpp
 index 730f01e..970a7c9 100644
 --- a/runtime/src/os/nn_services.cpp
@@ -3936,7 +5094,7 @@ index 730f01e..970a7c9 100644
  }
  Result act_mii_ex(uint8_t* data, uint8_t) {
 diff --git a/runtime/src/os/offline_services.cpp b/runtime/src/os/offline_services.cpp
-index b1de21c..634abf7 100644
+index b1de21c..95eeb15 100644
 --- a/runtime/src/os/offline_services.cpp
 +++ b/runtime/src/os/offline_services.cpp
 @@ -10,6 +10,7 @@
@@ -3947,7 +5105,41 @@ index b1de21c..634abf7 100644
  #include <cstring>
  #include <filesystem>
  #include <string>
-@@ -228,14 +229,22 @@ CAFE_EXPORT(nlibcurl, curl_global_init, curl_failed_init);
+@@ -135,22 +136,10 @@ CAFE_EXPORT(nn_nfp, OpenApplicationArea__Q2_2nn3nfpFUi, nfp_no_tag);
+ CAFE_EXPORT(nn_nfp, ReadApplicationArea__Q2_2nn3nfpFPvUi, nfp_no_tag);
+ CAFE_EXPORT(nn_nfp, WriteApplicationArea__Q2_2nn3nfpFPCvUiRCQ3_2nn3nfp5TagId, nfp_no_tag);
+ 
++// port/patch_h264.py: h264 now in port/os_extra.cpp.
+ // Video decoding (h264): not available yet, so every call fails and titles
+ // skip their movies.
+ // shortcut: no decoder; bridge to a host H.264 decoder when the movies should play.
+-CAFE_EXPORT(h264, H264DECGetImageSize, no_device);
+-CAFE_EXPORT(h264, H264DECMemoryRequirement, no_device);
+-CAFE_EXPORT(h264, H264DECCheckMemSegmentation, no_device);
+-CAFE_EXPORT(h264, H264DECInitParam, no_device);
+-CAFE_EXPORT(h264, H264DECOpen, no_device);
+-CAFE_EXPORT(h264, H264DECBegin, no_device);
+-CAFE_EXPORT(h264, H264DECSetBitstream, no_device);
+-CAFE_EXPORT(h264, H264DECExecute, no_device);
+-CAFE_EXPORT(h264, H264DECEnd, no_device);
+-CAFE_EXPORT(h264, H264DECClose, no_device);
+-CAFE_EXPORT(h264, H264DECSetParam_FPTR_OUTPUT, no_device);
+-CAFE_EXPORT(h264, H264DECSetParam_OUTPUT_PER_FRAME, no_device);
+-CAFE_EXPORT(h264, H264DECSetParam_USER_MEMORY, no_device);
+ 
+ // A DLC title for AOC_ListTitle, its content/ folder mounted at /vol/aoc<id>.
+ void register_aoc(uint64_t id, uint32_t group, uint16_t version, const std::filesystem::path& content) {
+@@ -185,9 +174,6 @@ CAFE_EXPORT(padscore, WENCGetEncodeData, zero);
+ CAFE_EXPORT(padscore, WPADInit, no_op);
+ CAFE_EXPORT(padscore, WPADSetExtensionCallback, zero);
+ CAFE_EXPORT(padscore, WPADGetInfoAsync, no_device);
+-CAFE_EXPORT(padscore, WPADCanSendStreamData, zero);
+-CAFE_EXPORT(padscore, WPADSendStreamData, no_device);
+-CAFE_EXPORT(padscore, WPADControlSpeaker, no_device);
+ 
+ // GamePad extras.
+ CAFE_EXPORT(vpad, VPADEnableStickCrossClamp, no_op);
+@@ -228,14 +214,22 @@ CAFE_EXPORT(nlibcurl, curl_global_init, curl_failed_init);
  CAFE_EXPORT(sysapp, SYSGetArguments, zero);
  CAFE_EXPORT(sysapp, SYSSwitchToEManual, no_op);
  CAFE_EXPORT(sysapp, SYSSwitchToEShop, no_op);
@@ -4272,6 +5464,27 @@ index 190da81..bccb642 100644
  CAFE_EXPORT(snd_user, MIXUpdateSettings, MIXUpdateSettings);
  CAFE_EXPORT(snd_user, MIXSetDeviceSoundMode, MIXSetDeviceSoundMode);
  
+diff --git a/runtime/src/os/sync.cpp b/runtime/src/os/sync.cpp
+index a0359fd..a5325b9 100644
+--- a/runtime/src/os/sync.cpp
++++ b/runtime/src/os/sync.cpp
+@@ -48,8 +48,14 @@ void lock_mutex(KernelLock& lock, uint32_t mutex, uint32_t self) {
+ }
+ 
+ void unlock_mutex(uint32_t mutex, uint32_t self) {
+-    if (mutex_owner(mutex) != self) {
+-        fatal("OSUnlockMutex on 0x%08X by a thread that does not own it", mutex);
++    if (mutex_owner(mutex) != self) { // port/patch_mutex_unlock.py: coreinit ignores it
++        static std::unordered_map<uint32_t, bool> said;
++        if (!said[mutex]) {
++            said[mutex] = true;
++            std::fprintf(stderr, "port: OSUnlockMutex on 0x%08X by a thread that does not own it (owner 0x%08X): ignored\n",
++                         mutex, mutex_owner(mutex));
++        }
++        return;
+     }
+     be<int32_t>& count = field<int32_t>(mutex, 0x20);
+     count -= 1;
 diff --git a/runtime/src/os/system_config.cpp b/runtime/src/os/system_config.cpp
 index 852f5d4..d68e479 100644
 --- a/runtime/src/os/system_config.cpp
@@ -4366,7 +5579,7 @@ index 852f5d4..d68e479 100644
      static constexpr Setting kSettings[] = {
          {"cafe.language", kLanguageEnglish},
 diff --git a/runtime/src/os/thread.cpp b/runtime/src/os/thread.cpp
-index 903c088..55c9e3f 100644
+index 903c088..5332ec3 100644
 --- a/runtime/src/os/thread.cpp
 +++ b/runtime/src/os/thread.cpp
 @@ -247,6 +247,20 @@ void run_profile(double start, double seconds, std::string path) {
@@ -4390,7 +5603,32 @@ index 903c088..55c9e3f 100644
      // TTT2_DUMP_THREADS_AT=seconds: then, each guest thread's name and where it is in guest code
      // (its last call out: the LR and the saved return addresses), for finding what a title waits on.
      if (const char* at = std::getenv("TTT2_DUMP_THREADS_AT")) {
-@@ -298,6 +312,11 @@ void* host_main(void* argument) {
+@@ -281,7 +295,23 @@ void request_profile_now() {
+ #else
+ void note_profile_thread(uint32_t) {}
+ void forget_profile_thread() {}
+-void start_profiler() {}
++void start_profiler() {
++    // port/patch_dump_threads_linux.py: TTT2_DUMP_THREADS_AT=seconds (as on Windows)
++    if (const char* at = std::getenv("TTT2_DUMP_THREADS_AT")) {
++        const double seconds = std::atof(at);
++        std::thread([seconds] {
++            std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
++            KernelLock lock(g_kernel);
++            for (const auto& [guest, t] : g_threads) {
++                const uint32_t name = field<uint32_t>(guest, kName);
++                std::fprintf(stderr, "thread %08X \"%s\" state %u:\n", guest,
++                             name ? std::string(guest_string(name)).c_str() : "", state_of(guest));
++                dump_backtrace(t->ctx);
++            }
++            std::fflush(stderr);
++        }).detach();
++    }
++}
+ void request_profile_now() {}
+ #endif
+ 
+@@ -298,6 +328,11 @@ void* host_main(void* argument) {
      if (setjmp(t->exit_jump) == 0) {
          const uint32_t entry = field<uint32_t>(t->guest, kEntry);
          if (t == g_main_thread && g_preinit_user != 0) run_preinit_user(t->ctx, g_preinit_user);
@@ -4402,7 +5640,37 @@ index 903c088..55c9e3f 100644
          cafe_ppc_lookup(entry)(t->ctx, guest_base());
          exit_value = t->ctx.r[3];
      } else {
-@@ -534,7 +553,14 @@ int32_t OSResumeThread(GuestAddress thread) {
+@@ -426,6 +461,13 @@ Thread* thread_for(uint32_t guest_thread) {
+     return it == g_threads.end() ? nullptr : it->second;
+ }
+ 
++// port/patch_fs_async_defer.py: guest work for the "cafe system" thread (FS async callbacks).
++void defer_guest_work(std::function<void(PPCContext&)> work) {
++    KernelLock lock(g_kernel);
++    g_deferred.push_back(std::move(work));
++    wake(kWaitDeferred);
++}
++
+ Thread* create_internal_thread(const char* name, int core) {
+     KernelLock lock(g_kernel);
+     return make_internal_thread(name, 0x10000, core);
+@@ -510,6 +552,15 @@ bool OSCreateThread(GuestAddress thread, uint32_t entry, uint32_t argc, uint32_t
+     }
+     init_guest_thread(thread.value, entry, stack_top, stack_size, priority,
+                       static_cast<uint8_t>(attr));
++    if (entry == 0) { // port/patch_thread_null_entry.py: only for OSRunThread later
++        set_state(thread.value, kNone);
++        field<int32_t>(thread.value, kSuspend) = 0;
++        if (trace_threads()) {
++            std::fprintf(stderr, "ttt2: thread 0x%08X created without entry (for OSRunThread), by 0x%08X\n",
++                         thread.value, current_thread()->guest);
++        }
++        return true;
++    }
+     auto* t = new Thread;
+     t->guest = thread.value;
+     t->core = core_for(static_cast<uint8_t>(attr), current_thread()->core);
+@@ -534,7 +585,14 @@ int32_t OSResumeThread(GuestAddress thread) {
          suspend = previous - 1;
          if (previous == 1 && !t->host_started) {
              set_state(thread.value, kRunning);
@@ -4417,7 +5685,7 @@ index 903c088..55c9e3f 100644
          }
      }
      return previous;
-@@ -635,7 +661,85 @@ uint32_t OSGetCoreCount() { return 3; }
+@@ -635,7 +693,85 @@ uint32_t OSGetCoreCount() { return 3; }
  
  // The main thread is core 1's default thread.
  // shortcut: cores 0 and 2 have no default thread (0); create them if a title runs work on them (OSRunThread).
@@ -4504,7 +5772,7 @@ index 903c088..55c9e3f 100644
  
  uint32_t OSSetThreadDeallocator(GuestAddress thread, uint32_t deallocator) {
      be<uint32_t>& slot = field<uint32_t>(thread.value, kDeallocator);
-@@ -687,6 +791,9 @@ CAFE_EXPORT(coreinit, OSSetThreadSpecific, OSSetThreadSpecific);
+@@ -687,6 +823,9 @@ CAFE_EXPORT(coreinit, OSSetThreadSpecific, OSSetThreadSpecific);
  CAFE_EXPORT(coreinit, OSGetThreadSpecific, OSGetThreadSpecific);
  CAFE_EXPORT(coreinit, OSGetCoreCount, OSGetCoreCount);
  CAFE_EXPORT(coreinit, OSGetDefaultThread, OSGetDefaultThread);
@@ -4515,7 +5783,7 @@ index 903c088..55c9e3f 100644
  CAFE_EXPORT(coreinit, OSSleepTicks, OSSleepTicks);
  CAFE_EXPORT(coreinit, OSWaitMicroseconds, OSWaitMicroseconds);
 diff --git a/runtime/src/vfs.cpp b/runtime/src/vfs.cpp
-index 699bc1c..41a2dee 100644
+index 699bc1c..fac3c98 100644
 --- a/runtime/src/vfs.cpp
 +++ b/runtime/src/vfs.cpp
 @@ -16,6 +16,7 @@
@@ -4526,7 +5794,25 @@ index 699bc1c..41a2dee 100644
  
  namespace cafe::vfs {
  namespace {
-@@ -124,13 +125,29 @@ struct Resolved {
+@@ -98,6 +99,17 @@ bool iequals(std::string_view a, std::string_view b) {
+            });
+ }
+ 
++// port/patch_fs_cwd.py: the title's working directory (FSChangeDir), for relative guest paths
++std::mutex g_cwd_mutex;
++std::string g_cwd = "/";
++
++// port/patch_fs_cwd.py: a guest path without a leading '/' is below the working directory
++std::string absolute(std::string_view path) {
++    if (path.empty() || path[0] == '/') return std::string(path);
++    std::lock_guard lock(g_cwd_mutex);
++    return g_cwd + "/" + std::string(path);
++}
++
+ // "/vol/content/./a//b/../c" -> {"vol", "content", "a", "c"}
+ std::vector<std::string> components(std::string_view path) {
+     std::vector<std::string> parts;
+@@ -124,19 +136,47 @@ struct Resolved {
      Area area = Area::kNone;
      std::string relative;              // inside the game source: "content/hdd/x.bin"
      std::vector<std::string> save_parts; // inside the save root, or the DLC folder for kAoc
@@ -4551,12 +5837,32 @@ index 699bc1c..41a2dee 100644
 +
  // The host folder a save or DLC path is in.
  fs::path area_root(const Resolved& r, std::string_view path) {
++    const std::string full = absolute(path); // port/patch_fs_cwd.py
      if (r.area != Area::kAoc) return g_save_root;
+-    std::string name = components(path)[1];
 +    if (r.sys) return sys_root();
-     std::string name = components(path)[1];
++    std::string name = components(full)[1];
      std::transform(name.begin(), name.end(), name.begin(), ::tolower);
      return g_aoc.at(name);
-@@ -154,6 +171,19 @@ Resolved resolve(std::string_view path) {
+ }
+ 
+-Resolved resolve(std::string_view path) {
++} // namespace
++
++void set_cwd(std::string_view path) { // port/patch_fs_cwd.py
++    std::lock_guard lock(g_cwd_mutex);
++    g_cwd = path.empty() ? std::string("/") : std::string(path);
++}
++
++namespace {
++
++Resolved resolve(std::string_view guest_path) {
++    const std::string full = absolute(guest_path); // port/patch_fs_cwd.py
++    const std::string_view path = full;
+     const auto parts = components(path);
+     Resolved r;
+     if (parts.size() < 2 || !iequals(parts[0], "vol")) return r;
+@@ -154,6 +194,21 @@ Resolved resolve(std::string_view path) {
          r.save_parts.insert(r.save_parts.end(), parts.begin() + 2, parts.end());
          return r;
      }
@@ -4567,7 +5873,9 @@ index 699bc1c..41a2dee 100644
 +        r.save_parts.insert(r.save_parts.end(), parts.begin() + 2, parts.end());
 +        return r;
 +    }
-+    if (parts.size() >= 3 && iequals(parts[1], "storage_mlc01") && iequals(parts[2], "sys") && !sys_root().empty()) {
++    // port/patch_hfio_sys.py: storage_hfiomlc01 is the same system area
++    if (parts.size() >= 3 && (iequals(parts[1], "storage_mlc01") || iequals(parts[1], "storage_hfiomlc01")) &&
++        iequals(parts[2], "sys") && !sys_root().empty()) {
 +        r.area = Area::kAoc; // read-only host folder
 +        r.sys = true;
 +        r.save_parts.assign(parts.begin() + 3, parts.end());
@@ -4576,7 +5884,7 @@ index 699bc1c..41a2dee 100644
      std::string lower = parts[1];
      std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
      if (g_aoc.count(lower)) {
-@@ -409,8 +439,39 @@ std::optional<std::vector<uint8_t>> read_whole(std::string_view path) {
+@@ -409,8 +464,39 @@ std::optional<std::vector<uint8_t>> read_whole(std::string_view path) {
      return data;
  }
  

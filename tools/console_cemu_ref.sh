@@ -2,8 +2,8 @@
 # console_cemu_ref.sh TAG [host]: Super Mario 3D World in Cemu (the emulator entry) on the console, no input, screen
 # pictures every 10 s from 30 s to 100 s, as a reference for the native port's brightness. The player's Cemu save of
 # the title (usr/save/00050000/1010ed00) is backed up first and put back if anything in it changed.
-TAG=${1:-cemu1}; H=${2:-root@192.168.178.75}
-OUT=/d/retro/wiiurecomp/console/run/3dworld-$TAG; mkdir -p "$OUT"
+TAG=${1:-cemu1}; H=${2:-${CONSOLE_HOST:-root@batocera.local}}
+OUT=${WIIU_WORK:-$HOME/wiiurecomp}/console/run/3dworld-$TAG; mkdir -p "$OUT"
 mkdir /tmp/wiiu-console-test.lock 2>/dev/null || { echo "stop: another console test is running"; exit 1; }
 trap 'rmdir /tmp/wiiu-console-test.lock 2>/dev/null' EXIT
 ROM="/userdata/roms/wiiu/Super Mario 3D World/code/RedCarpet.rpx"
