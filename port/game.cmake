@@ -1,0 +1,15 @@
+# Appended to the runtime's top-level CMakeLists.txt by port/setup.sh: one program for any title's
+# generated code. -DGAME_GENERATED_DIR=<cafe-recomp output> -DGAME_MAIN=<port>/game_main.cpp
+set(GAME_GENERATED_DIR "" CACHE PATH "cafe-recomp output directory for the title")
+set(GAME_MAIN "" CACHE FILEPATH "game_main.cpp")
+set(GAME_EXTRA "" CACHE STRING "more sources (netplay_none.cpp on Linux)")
+if(GAME_GENERATED_DIR)
+    include(${GAME_GENERATED_DIR}/sources.cmake)
+    add_library(game_generated OBJECT ${CAFE_GENERATED_SOURCES})
+    target_include_directories(game_generated PRIVATE runtime/include)
+    target_compile_features(game_generated PRIVATE cxx_std_20)
+    target_compile_options(game_generated PRIVATE ${TTT2_GENERATED_OPTIONS})
+    add_executable(cafegame ${GAME_MAIN} ${GAME_EXTRA})
+    target_include_directories(cafegame PRIVATE runtime/src)
+    target_link_libraries(cafegame PRIVATE cafe_runtime game_generated)
+endif()
